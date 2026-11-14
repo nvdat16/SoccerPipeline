@@ -1,0 +1,13 @@
+.venv/
+__pycache__/
+*.pyc
+.DS_Store
+
+# weights (tải bằng download_models.py, quá nặng để commit)
+models/*
+!models/.gitkeep
+*.pt
+*.pth
+*.ckpt
+
+outputs/

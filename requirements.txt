@@ -1,0 +1,18 @@
+# torch / torchvision / numpy / opencv: dùng bản có sẵn trên Kaggle (KHÔNG cài lại).
+# Chạy local thì cài thêm: pip install torch torchvision opencv-python numpy
+
+# Detect + track (ByteTrack) + pose
+ultralytics>=8.3
+lapx>=0.5.5
+
+# PARSeq runtime — checkpoint được train bằng PL 1.9, không dùng PL 2.x
+pytorch-lightning==1.9.5
+torchmetrics<1.0
+timm==0.9.16
+nltk
+setuptools<80        # PL 1.9 cần pkg_resources (đã bị gỡ ở setuptools mới)
+
+# tiện ích
+gdown>=5.1
+tqdm
+pyyaml
