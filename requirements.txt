@@ -2,7 +2,7 @@
 # Chạy local thì cài thêm: pip install torch torchvision opencv-python numpy
 
 # Detect + track (ByteTrack) + pose
-ultralytics>=8.3
+ultralytics>=8.4.0   # YOLO26 cần >= 8.4.0
 lapx>=0.5.5
 
 # PARSeq runtime — checkpoint được train bằng PL 1.9, không dùng PL 2.x

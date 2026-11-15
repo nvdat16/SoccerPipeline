@@ -58,6 +58,7 @@ Nếu `--det-model` không phải model pose (ví dụ detector tự train), pip
 - `<tên>_jersey.mp4`: bbox xanh kèm `#số` khi đã nhận ra số áo, xám kèm `idN` khi chưa
 - `tracks.json`: mỗi track gồm `jersey_number` (-1 nếu không đọc được), `votes`, `attempts`, `legible`, `str_reads`
 - `detections.csv`: `frame, track_id, x1, y1, x2, y2, det_conf, jersey_number`
+- `timing.json`: thời gian suy luận từng bước (decode, detect+track, legibility, pose, crop, PARSeq, vote, render)
 
 ## Cấu trúc
 ```

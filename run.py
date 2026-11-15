@@ -29,6 +29,7 @@ import config
 from pipeline.aggregator import TrackletVoter
 from pipeline.device import pick_device
 from pipeline.legibility import LegibilityModel
+from pipeline.profiler import StepTimer
 from pipeline.str_recognizer import JerseyNumberRecognizer
 from pipeline.torso import match_pose_to_box, torso_box
 
@@ -75,7 +76,7 @@ class PlayerJerseyPipeline:
         self.pose = None if self.det_is_pose else YOLO(args.pose_model)
 
     # ------------------------------------------------------------------ pass 1
-    def analyse(self, frames, total, crops_dir=None):
+    def analyse(self, frames, total, prof: StepTimer, crops_dir=None):
         a = self.args
         detector = YOLO(a.det_model)  # model mới cho mỗi video -> reset tracker
         yolo_kw = dict(conf=a.conf, imgsz=a.imgsz, classes=a.classes, device=self.device, verbose=False)
@@ -84,8 +85,17 @@ class PlayerJerseyPipeline:
         span = {}                 # track_id -> [first_frame, last_frame]
         stats = defaultdict(lambda: {"attempts": 0, "legible": 0, "no_pose": 0})
 
-        for idx, frame in tqdm(frames, total=total, desc="analyse"):
-            r = detector.track(frame, persist=True, tracker=a.tracker, **yolo_kw)[0]
+        for idx, frame in tqdm(timed_frames(frames, prof), total=total, desc="analyse"):
+            with prof("2. detect+track", n_items=1):
+                t0 = time.perf_counter()
+                r = detector.track(frame, persist=True, tracker=a.tracker, **yolo_kw)[0]
+                total_ms = (time.perf_counter() - t0) * 1000
+            sp = r.speed  # ms, ultralytics tự đo
+            prof.add("   ├ yolo preprocess", sp.get("preprocess", 0))
+            prof.add("   ├ yolo inference", sp.get("inference", 0))
+            prof.add("   ├ yolo postprocess", sp.get("postprocess", 0))
+            prof.add("   └ tracker (ByteTrack)", max(0.0, total_ms - sum(sp.get(k, 0) for k in
+                                                                    ("preprocess", "inference", "postprocess"))))
             if r.boxes is None or r.boxes.id is None:
                 continue
             boxes = r.boxes.xyxy.cpu().numpy()
@@ -108,9 +118,10 @@ class PlayerJerseyPipeline:
             if a.no_legibility:
                 leg_prob = np.ones(len(cand))
             else:
-                player_crops = [frame[int(boxes[i][1]):int(boxes[i][3]), int(boxes[i][0]):int(boxes[i][2])]
-                                for i in cand]
-                leg_prob = self.legibility.predict(player_crops)
+                with prof("3. legibility", n_items=len(cand)):
+                    player_crops = [frame[int(boxes[i][1]):int(boxes[i][3]), int(boxes[i][0]):int(boxes[i][2])]
+                                    for i in cand]
+                    leg_prob = self.legibility.predict(player_crops)
 
             legible = [i for i, p in zip(cand, leg_prob) if p > a.legibility_th]
             for i in cand:
@@ -120,10 +131,12 @@ class PlayerJerseyPipeline:
 
             # --- keypoints -> crop thân áo
             if kpts is None:
-                pr = self.pose(frame, imgsz=a.imgsz, device=self.device, verbose=False)[0]
-                p_boxes = pr.boxes.xyxy.cpu().numpy() if pr.boxes is not None else np.zeros((0, 4))
-                p_kpts = pr.keypoints.data.cpu().numpy() if pr.keypoints is not None else None
+                with prof("4. pose (model riêng)", n_items=1):
+                    pr = self.pose(frame, imgsz=a.imgsz, device=self.device, verbose=False)[0]
+                    p_boxes = pr.boxes.xyxy.cpu().numpy() if pr.boxes is not None else np.zeros((0, 4))
+                    p_kpts = pr.keypoints.data.cpu().numpy() if pr.keypoints is not None else None
             torso_crops, owners = [], []
+            t_crop = time.perf_counter()
             for i in legible:
                 tid = int(ids[i])
                 stats[tid]["legible"] += 1
@@ -139,22 +152,30 @@ class PlayerJerseyPipeline:
                 x1, y1, x2, y2 = tb
                 torso_crops.append(frame[y1:y2, x1:x2])
                 owners.append(tid)
+            prof.add("5. torso crop", (time.perf_counter() - t_crop) * 1000, n_items=len(legible))
 
             # --- PARSeq đọc số
-            for tid, crop, (label, prob) in zip(owners, torso_crops, self.recognizer.predict(torso_crops)):
+            if not torso_crops:
+                continue
+            with prof("6. STR (PARSeq)", n_items=len(torso_crops)):
+                preds = self.recognizer.predict(torso_crops)
+            for tid, crop, (label, prob) in zip(owners, torso_crops, preds):
                 voter.add(tid, label, prob)
                 if crops_dir is not None:
-                    cv2.imwrite(str(crops_dir / f"t{tid:04d}_f{idx:06d}_{label or 'x'}_{prob:.2f}.jpg"), crop)
+                    with prof("   save crops (debug)", n_items=1):
+                        cv2.imwrite(str(crops_dir / f"t{tid:04d}_f{idx:06d}_{label or 'x'}_{prob:.2f}.jpg"), crop)
 
         return voter, frame_log, span, stats
 
     # ------------------------------------------------------------------ pass 2
     @staticmethod
-    def render(src, dst, frame_log, numbers, fps, size, max_frames):
+    def render(src, dst, frame_log, numbers, fps, size, max_frames, prof: StepTimer):
         by_frame = defaultdict(list)
         for row in frame_log:
             by_frame[row[0]].append(row)
         tmp = dst.with_suffix(".tmp.mp4")
+        t0 = time.perf_counter()
+        n = 0
         writer = cv2.VideoWriter(str(tmp), cv2.VideoWriter_fourcc(*"mp4v"), fps, size)
         for idx, frame in tqdm(read_frames(src, max_frames), total=None, desc="render"):
             for _, tid, x1, y1, x2, y2, _ in by_frame.get(idx, []):
@@ -166,11 +187,14 @@ class PlayerJerseyPipeline:
                 cv2.rectangle(frame, (x1, y1 - th - 6), (x1 + tw + 4, y1), color, -1)
                 cv2.putText(frame, text, (x1 + 2, y1 - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2)
             writer.write(frame)
+            n += 1
         writer.release()
+        prof.add("9. render video", (time.perf_counter() - t0) * 1000, n_items=n)
         # mp4v không xem được trong trình duyệt/notebook -> chuyển sang H.264 nếu có ffmpeg
         if shutil.which("ffmpeg"):
-            subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-i", str(tmp), "-c:v", "libx264",
-                            "-pix_fmt", "yuv420p", "-preset", "fast", str(dst)], check=False)
+            with prof("10. ffmpeg -> H.264", n_items=1):
+                subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-i", str(tmp), "-c:v", "libx264",
+                                "-pix_fmt", "yuv420p", "-preset", "fast", str(dst)], check=False)
             if dst.exists():
                 tmp.unlink()
                 return dst
@@ -195,10 +219,12 @@ class PlayerJerseyPipeline:
         if a.max_frames:
             total = min(total or a.max_frames, a.max_frames)
 
-        t0 = time.time()
-        voter, frame_log, span, stats = self.analyse(read_frames(src, a.max_frames), total, crops_dir)
-        elapsed = time.time() - t0
+        prof = StepTimer(self.device)
+        t_start = time.perf_counter()
+        voter, frame_log, span, stats = self.analyse(read_frames(src, a.max_frames), total, prof, crops_dir)
+        elapsed = time.perf_counter() - t_start
 
+        t_agg = time.perf_counter()
         tracks, numbers = {}, {}
         for tid in sorted(span):
             num, weight = voter.best(tid)
@@ -212,7 +238,9 @@ class PlayerJerseyPipeline:
                 **stats[tid],
                 "str_reads": len(voter.reads.get(tid, [])),
             }
+        prof.add("7. aggregate (vote)", (time.perf_counter() - t_agg) * 1000, n_items=len(span))
 
+        t_out = time.perf_counter()
         with open(out_dir / "tracks.json", "w") as f:
             json.dump({"source": str(src), "fps": fps, "tracks": tracks}, f, indent=2)
         with open(out_dir / "detections.csv", "w", newline="") as f:
@@ -220,8 +248,9 @@ class PlayerJerseyPipeline:
             w.writerow(["frame", "track_id", "x1", "y1", "x2", "y2", "det_conf", "jersey_number"])
             for row in frame_log:
                 w.writerow([*row[:6], f"{row[6]:.3f}", numbers.get(row[1], -1)])
+        prof.add("8. write json/csv", (time.perf_counter() - t_out) * 1000)
 
-        n_frames = (frame_log[-1][0] + 1) if frame_log else 0
+        n_frames = len(prof.calls.get("2. detect+track", []))
         identified = {t: n for t, n in numbers.items() if n > 0}
         print(f"\n[{src.name}] {n_frames} frames, {elapsed:.1f}s ({n_frames / max(elapsed, 1e-6):.1f} fps)")
         print(f"  tracks: {len(tracks)}, có số áo: {len(identified)}")
@@ -229,9 +258,33 @@ class PlayerJerseyPipeline:
             print(f"    track {t:>4}: #{n:<3} (weight {tracks[t]['weight']}, frames {span[t][0]}-{span[t][1]})")
 
         if not a.no_video:
-            path = self.render(src, out_dir / f"{src.stem}_jersey.mp4", frame_log, numbers, fps, size, a.max_frames)
+            path = self.render(src, out_dir / f"{src.stem}_jersey.mp4", frame_log, numbers, fps, size,
+                               a.max_frames, prof)
             print(f"  video: {path}")
         print(f"  json:  {out_dir / 'tracks.json'}")
+
+        timing = prof.summary(n_frames, time.perf_counter() - t_start)
+        timing["analyse_fps"] = round(n_frames / max(elapsed, 1e-9), 2)
+        timing["config"] = {"det_model": a.det_model, "pose_model": None if self.det_is_pose else a.pose_model,
+                            "imgsz": a.imgsz, "stride": a.stride, "no_legibility": a.no_legibility}
+        StepTimer.print_table(timing)
+        print(f"  analyse (pass 1, không tính render): {timing['analyse_fps']} fps")
+        with open(out_dir / "timing.json", "w") as f:
+            json.dump(timing, f, indent=2, ensure_ascii=False)
+        print(f"  timing: {out_dir / 'timing.json'}")
+
+
+def timed_frames(frames, prof: StepTimer):
+    """Bọc generator đọc frame để đo thời gian decode video."""
+    it = iter(frames)
+    while True:
+        t0 = time.perf_counter()
+        try:
+            item = next(it)
+        except StopIteration:
+            return
+        prof.add("1. decode frame", (time.perf_counter() - t0) * 1000)
+        yield item
 
 
 def read_frames(src: Path, max_frames: int = 0):
