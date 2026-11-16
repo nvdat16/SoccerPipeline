@@ -31,7 +31,7 @@ from pipeline.device import pick_device
 from pipeline.legibility import LegibilityModel
 from pipeline.profiler import StepTimer
 from pipeline.str_recognizer import JerseyNumberRecognizer
-from pipeline.torso import match_pose_to_box, torso_box
+from pipeline.torso import match_pose_to_box, torso_box, torso_from_bbox
 
 VIDEO_EXTS = {".mp4", ".avi", ".mov", ".mkv", ".webm", ".m4v"}
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp"}
@@ -44,8 +44,9 @@ def parse_args():
     ap.add_argument("--models-dir", default=str(config.MODELS_DIR))
     ap.add_argument("--det-model", default=config.DET_MODEL)
     ap.add_argument("--pose-model", default=config.POSE_MODEL)
-    ap.add_argument("--classes", type=int, nargs="+", default=config.PLAYER_CLASSES,
-                    help="class id của cầu thủ trong detector (COCO person = 0)")
+    ap.add_argument("--classes", nargs="+", default=None,
+                    help="class của cầu thủ, theo id hoặc tên (vd: '1 2' hoặc 'player goalkeeper'). "
+                         f"Mặc định: tự chọn các class có tên trong {config.PLAYER_CLASS_NAMES}")
     ap.add_argument("--tracker", default=config.TRACKER, help="bytetrack.yaml | botsort.yaml")
     ap.add_argument("--conf", type=float, default=config.DET_CONF)
     ap.add_argument("--imgsz", type=int, default=config.DET_IMGSZ)
@@ -54,6 +55,10 @@ def parse_args():
     ap.add_argument("--legibility-th", type=float, default=config.LEGIBILITY_THRESHOLD)
     ap.add_argument("--no-legibility", action="store_true",
                     help="bỏ qua legibility classifier, đọc số trên mọi cầu thủ (chậm hơn, nhiều nhiễu hơn)")
+    ap.add_argument("--torso-mode", choices=["pose", "bbox"], default=config.TORSO_MODE,
+                    help="pose: cắt thân áo theo keypoint vai/hông; bbox: cắt theo tỉ lệ bbox, bỏ hẳn model pose")
+    ap.add_argument("--torso-ratio", type=float, nargs=4, default=list(config.TORSO_BBOX_RATIO),
+                    metavar=("X1", "Y1", "X2", "Y2"), help="tỉ lệ thân áo trong bbox (cho --torso-mode bbox)")
     ap.add_argument("--kpt-conf", type=float, default=config.KPT_CONF)
     ap.add_argument("--max-reads", type=int, default=config.MAX_READS_PER_TRACK)
     ap.add_argument("--sum-th", type=float, default=config.SUM_THRESHOLD)
@@ -72,8 +77,19 @@ class PlayerJerseyPipeline:
         print(f"[init] device={self.device}")
         self.legibility = LegibilityModel(models_dir / config.LEGIBILITY_FILE, self.device, args.legibility_th)
         self.recognizer = JerseyNumberRecognizer(models_dir / config.STR_FILE, self.device)
-        self.det_is_pose = "pose" in Path(args.det_model).stem
-        self.pose = None if self.det_is_pose else YOLO(args.pose_model)
+        det = YOLO(args.det_model)
+        self.det_is_pose = det.task == "pose"
+        args.classes = resolve_classes(det.names, args.classes)
+        print(f"[init] detector={args.det_model} (task={det.task}) -> track classes "
+              f"{ {i: det.names[i] for i in args.classes} }")
+        if args.torso_mode == "bbox":
+            self.pose = None
+            print(f"[init] torso-mode=bbox (không dùng pose), ratio={tuple(args.torso_ratio)}")
+        elif self.det_is_pose:
+            self.pose = None
+        else:
+            self.pose = YOLO(args.pose_model)
+            print(f"[init] pose model={args.pose_model}")
 
     # ------------------------------------------------------------------ pass 1
     def analyse(self, frames, total, prof: StepTimer, crops_dir=None):
@@ -130,7 +146,8 @@ class PlayerJerseyPipeline:
                 continue
 
             # --- keypoints -> crop thân áo
-            if kpts is None:
+            bbox_mode = a.torso_mode == "bbox"
+            if kpts is None and not bbox_mode:
                 with prof("4. pose (model riêng)", n_items=1):
                     pr = self.pose(frame, imgsz=a.imgsz, device=self.device, verbose=False)[0]
                     p_boxes = pr.boxes.xyxy.cpu().numpy() if pr.boxes is not None else np.zeros((0, 4))
@@ -140,12 +157,15 @@ class PlayerJerseyPipeline:
             for i in legible:
                 tid = int(ids[i])
                 stats[tid]["legible"] += 1
-                if kpts is not None:
-                    k = kpts[i]
+                if bbox_mode:
+                    tb = torso_from_bbox(boxes[i], frame.shape, a.torso_ratio)
                 else:
-                    j = match_pose_to_box(boxes[i], p_boxes)
-                    k = p_kpts[j] if j >= 0 and p_kpts is not None else None
-                tb = torso_box(k, frame.shape, a.kpt_conf, config.TORSO_PADDING)
+                    if kpts is not None:
+                        k = kpts[i]
+                    else:
+                        j = match_pose_to_box(boxes[i], p_boxes)
+                        k = p_kpts[j] if j >= 0 and p_kpts is not None else None
+                    tb = torso_box(k, frame.shape, a.kpt_conf, config.TORSO_PADDING)
                 if tb is None:
                     stats[tid]["no_pose"] += 1
                     continue
@@ -265,13 +285,43 @@ class PlayerJerseyPipeline:
 
         timing = prof.summary(n_frames, time.perf_counter() - t_start)
         timing["analyse_fps"] = round(n_frames / max(elapsed, 1e-9), 2)
-        timing["config"] = {"det_model": a.det_model, "pose_model": None if self.det_is_pose else a.pose_model,
+        timing["config"] = {"det_model": a.det_model, "torso_mode": a.torso_mode,
+                            "pose_model": None if (self.det_is_pose or a.torso_mode == "bbox") else a.pose_model,
                             "imgsz": a.imgsz, "stride": a.stride, "no_legibility": a.no_legibility}
         StepTimer.print_table(timing)
         print(f"  analyse (pass 1, không tính render): {timing['analyse_fps']} fps")
         with open(out_dir / "timing.json", "w") as f:
             json.dump(timing, f, indent=2, ensure_ascii=False)
         print(f"  timing: {out_dir / 'timing.json'}")
+
+
+def resolve_classes(names: dict, spec) -> list:
+    """Đổi --classes (id hoặc tên) thành list id. Không truyền -> tự chọn theo tên class.
+
+    Tránh lỗi dùng id cứng: COCO có 0 = person, nhưng model bóng đá tự train
+    thường có 0 = ball -> chỉ track được bóng.
+    """
+    lower = {str(n).lower(): i for i, n in names.items()}
+    if not spec:
+        ids = [i for n, i in lower.items() if n in config.PLAYER_CLASS_NAMES]
+        if not ids:
+            raise SystemExit(f"Không tìm thấy class cầu thủ trong detector {names}. "
+                             f"Hãy chỉ định --classes (id hoặc tên).")
+        return sorted(ids)
+    ids = []
+    for s in spec:
+        if str(s).isdigit():
+            i = int(s)
+        elif str(s).lower() in lower:
+            i = lower[str(s).lower()]
+        else:
+            raise SystemExit(f"--classes: không có class '{s}' trong detector {names}")
+        if i not in names:
+            raise SystemExit(f"--classes: id {i} không tồn tại trong detector {names}")
+        ids.append(i)
+    if any(str(names[i]).lower() in {"ball", "sports ball"} for i in ids):
+        print("[warn] --classes đang gồm class bóng: bóng sẽ được track như cầu thủ")
+    return sorted(set(ids))
 
 
 def timed_frames(frames, prof: StepTimer):

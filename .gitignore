@@ -10,3 +10,9 @@ models/*
 *.ckpt
 
 outputs/
+
+# YOLO weights ultralytics tự tải (yolo26s-soccer.pt thì được commit)
+yolo11*.pt
+yolo26n*.pt
+yolo26s.pt
+yolo26s-pose.pt

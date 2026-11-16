@@ -24,6 +24,21 @@ def torso_box(kpts: np.ndarray, frame_shape, kpt_conf: float, padding: int) -> O
     return x1, y1, x2, y2
 
 
+def torso_from_bbox(box, frame_shape, ratio) -> Optional[tuple]:
+    """Cắt thân áo theo tỉ lệ cố định của bbox, không cần pose.
+    ratio = (x1, y1, x2, y2) theo tỉ lệ chiều rộng/cao của box."""
+    h_img, w_img = frame_shape[:2]
+    bx1, by1, bx2, by2 = [float(v) for v in box[:4]]
+    w, h = bx2 - bx1, by2 - by1
+    x1 = max(0, int(bx1 + ratio[0] * w))
+    y1 = max(0, int(by1 + ratio[1] * h))
+    x2 = min(w_img - 1, int(bx1 + ratio[2] * w))
+    y2 = min(h_img - 1, int(by1 + ratio[3] * h))
+    if x2 - x1 < 4 or y2 - y1 < 4:
+        return None
+    return x1, y1, x2, y2
+
+
 def match_pose_to_box(box, pose_boxes: np.ndarray) -> int:
     """Chọn pose có IoU lớn nhất với box cầu thủ (dùng khi chạy pose model riêng). -1 nếu không có."""
     if len(pose_boxes) == 0:
