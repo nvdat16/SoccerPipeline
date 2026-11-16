@@ -6,7 +6,6 @@ __pycache__/
 # weights (tải bằng download_models.py, quá nặng để commit)
 models/*
 !models/.gitkeep
-*.pt
 *.pth
 *.ckpt
 
