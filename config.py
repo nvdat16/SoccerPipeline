@@ -24,11 +24,22 @@ TRACKER = "bytetrack.yaml"
 
 LEGIBILITY_FILE = "legibility_resnet34_soccer_20240215.pth"
 STR_FILE = "parseq_epoch=24-step=2575-val_accuracy=95.6044-val_NED=96.3255.ckpt"
+# Minimap: calibration camera <-> sân
+#   pnlcalib: PnLCalib (HRNet keypoints 57 + vạch có tên 23, train SoccerNet) — mặc định
+#   roboflow: YOLOv8x-pose 32 điểm (nhanh hơn nhưng nhầm vòng cấm thành giữa sân khi camera zoom gần)
+PNL_KP_FILE = "pnlcalib_SV_kp.pth"
+PNL_LINE_FILE = "pnlcalib_SV_lines.pth"
+PITCH_FILE = "football-pitch-detection.pt"
 
 # Weights của paper (Koshkina & Elder, CVPRW 2024) — fine-tune trên SoccerNet
+# + pitch keypoints của Roboflow (https://github.com/roboflow/sports, examples/soccer/setup.sh)
 MODEL_URLS = {
     LEGIBILITY_FILE: "https://drive.google.com/uc?id=18HAuZbge3z8TSfRiX_FzsnKgiBs-RRNw",
     STR_FILE: "https://drive.google.com/uc?id=1uRln22tlhneVt3P6MePmVxBWSLMsL3bm",
+    PITCH_FILE: "https://drive.google.com/uc?id=1Ma5Kt86tgpdjCTKfum79YMgNnSjcoOyf",
+    # PnLCalib v1.0.0 (https://github.com/mguti97/PnLCalib), weights CC BY 4.0, ~265 MB mỗi file
+    PNL_KP_FILE: "https://github.com/mguti97/PnLCalib/releases/download/v1.0.0/SV_kp",
+    PNL_LINE_FILE: "https://github.com/mguti97/PnLCalib/releases/download/v1.0.0/SV_lines",
 }
 
 # ---------------------------------------------------------------- detection
@@ -53,3 +64,26 @@ MAX_READS_PER_TRACK = 60                # đủ mẫu thì ngừng đọc track 
 FILTER_THRESHOLD = 0.2                  # bỏ dự đoán có xác suất < 0.2
 SUM_THRESHOLD = 1.0                     # tổng trọng số tối thiểu để chốt số áo
 USE_BIAS = True                         # ưu tiên số 2 chữ số (0.61 vs 0.39)
+
+# ---------------------------------------------------------------- minimap (--minimap)
+# Video broadcast = 1 feed nhiều góc máy -> tính lại phép chiếu ảnh->sân mỗi frame, reset ở mỗi cắt cảnh.
+CALIB_BACKEND = "pnlcalib"              # pnlcalib | roboflow
+PNL_REFINE = False                      # PnLCalib: tinh chỉnh homography theo vạch (chậm hơn)
+PNL_MAX_REPROJ_PX = 8.0                 # PnLCalib: lỗi reprojection RMS tối đa (px, frame gốc)
+PITCH_SIZE = (105.0, 68.0)              # dài x rộng (m). Anfield 101x68, Old Trafford 105x68...
+PITCH_IMGSZ = 640                       # model pitch được train ở 640
+PITCH_DET_CONF = 0.3
+PITCH_KPT_CONF = 0.5                    # chỉ dùng điểm mốc có conf >= ngưỡng này
+PITCH_EVERY = {"pnlcalib": 5,           # chạy calibration mỗi N frame; giữa các lần nối bằng optical flow
+               "roboflow": 1}           # (PnLCalib: 2 HRNet-w48 ~0.8 s/frame trên M1, nhanh hơn nhiều trên T4)
+PITCH_RANSAC_M = 1.0                    # ngưỡng inlier RANSAC (mét trên sân)
+PITCH_MAX_REPROJ_M = 1.0                # lỗi reprojection trung vị tối đa để tin homography
+PITCH_MAX_JUMP_M = 5.0                  # H mới lệch H dự đoán > N mét -> coi là sai (trong cùng shot)
+PITCH_SWITCH_AFTER = 12                 # ...trừ khi các lần đo trong N frame liên tiếp cùng chỉ về vị trí mới
+PITCH_EMA = 0.5                         # trọng số H đo được khi trộn với H dự đoán từ optical flow
+PITCH_MAX_FLOW_FRAMES = 50              # nối bằng optical flow tối đa N frame (~2 s) khi thiếu điểm mốc
+PITCH_OUTSIDE_M = 3.0                   # cầu thủ chiếu ra ngoài sân quá N mét -> bỏ (ghế dự bị, khán đài)
+MINIMAP_WIDTH = 420                     # px
+MINIMAP_POS = "bottom-right"            # bottom-left | bottom-center | bottom-right | top-left | ...
+MINIMAP_STALE_FRAMES = 75               # frame không có phép chiếu: giữ chấm mờ tối đa N frame (~3 s)
+REFEREE_CLASS_NAMES = ["referee"]       # --minimap: track thêm trọng tài (vẽ màu đen, không đọc số)

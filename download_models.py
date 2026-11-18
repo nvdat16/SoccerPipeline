@@ -1,8 +1,10 @@
-"""Tải weights legibility + PARSeq (SoccerNet) từ Google Drive về MODELS_DIR.
+"""Tải weights legibility + PARSeq (SoccerNet) + pitch keypoints (Roboflow, cho --minimap)
+từ Google Drive về MODELS_DIR.
 
 YOLO weights (yolo11*-pose.pt) được ultralytics tự tải khi chạy lần đầu.
 """
 import argparse
+import urllib.request
 from pathlib import Path
 
 import gdown
@@ -23,7 +25,10 @@ def main():
             print(f"[skip] {dst} đã có")
             continue
         print(f"[download] {name}")
-        gdown.download(url, str(dst), quiet=False)
+        if "drive.google.com" in url:
+            gdown.download(url, str(dst), quiet=False)
+        else:
+            urllib.request.urlretrieve(url, str(dst))
         if not dst.exists():
             raise SystemExit(
                 f"Tải {name} thất bại (Google Drive có thể bị giới hạn lượt tải). "

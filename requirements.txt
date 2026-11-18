@@ -16,3 +16,7 @@ setuptools<80        # PL 1.9 cần pkg_resources (đã bị gỡ ở setuptools
 gdown>=5.1
 tqdm
 pyyaml
+
+# Minimap với --calib pnlcalib (Kaggle có sẵn cả hai)
+scipy
+shapely

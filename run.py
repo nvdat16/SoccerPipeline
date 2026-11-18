@@ -10,6 +10,9 @@ Các bước, mỗi frame:
      c. PARSeq đọc số trên crop thân áo.
   3. Hết video: gộp các lần đọc theo track (bỏ phiếu có trọng số) để ra 1 số áo / track.
   4. Render video kết quả và xuất JSON/CSV.
+
+Với --minimap, thêm mỗi frame: phát hiện cắt cảnh (reset tracker + phép chiếu), pitch keypoints ->
+homography ảnh->sân, chiếu chân cầu thủ lên sân (mét); cuối cùng làm mượt vị trí và vẽ minimap.
 """
 import argparse
 import csv
@@ -29,7 +32,10 @@ import config
 from pipeline.aggregator import TrackletVoter
 from pipeline.device import pick_device
 from pipeline.legibility import LegibilityModel
+from pipeline.minimap import MinimapRenderer, draw_debug, overlay, smooth_positions
+from pipeline.pitch import PitchCalibrator, PitchConfig, project
 from pipeline.profiler import StepTimer
+from pipeline.shots import ShotDetector
 from pipeline.str_recognizer import JerseyNumberRecognizer
 from pipeline.torso import match_pose_to_box, torso_box, torso_from_bbox
 
@@ -66,7 +72,50 @@ def parse_args():
     ap.add_argument("--device", default="auto", help="auto | cuda | mps | cpu")
     ap.add_argument("--no-video", action="store_true", help="không render video kết quả")
     ap.add_argument("--save-crops", action="store_true", help="lưu crop thân áo + số đọc được (debug)")
-    return ap.parse_args()
+
+    mm = ap.add_argument_group("minimap")
+    mm.add_argument("--minimap", action=argparse.BooleanOptionalAction, default=False,
+                    help="dựng minimap 2D: vị trí (mét) của cầu thủ trên sân, vẽ ở góc video + positions.csv")
+    mm.add_argument("--calib", choices=["pnlcalib", "roboflow"], default=config.CALIB_BACKEND,
+                    help="pnlcalib: HRNet điểm + vạch có tên (chính xác, chậm hơn); "
+                         "roboflow: YOLOv8-pose 32 điểm (nhanh, hay nhầm vòng cấm thành giữa sân)")
+    mm.add_argument("--pnl-refine", action=argparse.BooleanOptionalAction, default=config.PNL_REFINE,
+                    help="PnLCalib: tinh chỉnh homography theo các vạch sân")
+    mm.add_argument("--pitch-model", default=None, help=f"(--calib roboflow) mặc định <models-dir>/{config.PITCH_FILE}")
+    mm.add_argument("--pitch-size", type=float, nargs=2, default=list(config.PITCH_SIZE),
+                    metavar=("LENGTH", "WIDTH"), help="kích thước sân (m)")
+    mm.add_argument("--pitch-kpt-conf", type=float, default=config.PITCH_KPT_CONF)
+    mm.add_argument("--pitch-every", type=int, default=None,
+                    help=f"chạy calibration mỗi N frame, giữa các lần nối bằng optical flow "
+                         f"(mặc định {config.PITCH_EVERY})")
+    mm.add_argument("--pitch-debug", action="store_true",
+                    help="vẽ vạch sân chiếu ngược + keypoints lên video (kiểm tra homography)")
+    mm.add_argument("--reset-on-cut", action=argparse.BooleanOptionalAction, default=None,
+                    help="reset tracker ở mỗi cắt cảnh (mặc định: bật khi --minimap)")
+    mm.add_argument("--minimap-video", action="store_true", help="xuất thêm video chỉ có minimap")
+    mm.add_argument("--minimap-pos", default=config.MINIMAP_POS)
+    a = ap.parse_args()
+    if a.reset_on_cut is None:
+        a.reset_on_cut = a.minimap
+    if a.pitch_every is None:
+        a.pitch_every = config.PITCH_EVERY[a.calib]
+    return a
+
+
+def role_of(name: str) -> str:
+    n = str(name).lower()
+    if n in ("goalkeeper", "goalie"):
+        return "goalkeeper"
+    if n in config.REFEREE_CLASS_NAMES:
+        return "referee"
+    return "player"
+
+
+def reset_tracker(detector):
+    """Xoá mọi track đang có (sau cắt cảnh, vị trí bbox cũ không còn liên quan).
+    Một số bản ultralytics đặt lại ID về 1 khi reset -> run.py tự cộng offset để ID không trùng."""
+    for t in getattr(getattr(detector, "predictor", None), "trackers", None) or []:
+        t.reset()
 
 
 class PlayerJerseyPipeline:
@@ -79,9 +128,45 @@ class PlayerJerseyPipeline:
         self.recognizer = JerseyNumberRecognizer(models_dir / config.STR_FILE, self.device)
         det = YOLO(args.det_model)
         self.det_is_pose = det.task == "pose"
+        self.class_names = det.names
         args.classes = resolve_classes(det.names, args.classes)
+        self.read_classes = set(args.classes)          # chỉ đọc số áo các class này
+        if args.minimap:                               # minimap vẽ cả trọng tài (không đọc số)
+            args.classes = sorted(set(args.classes) | {i for i, n in det.names.items()
+                                                       if str(n).lower() in config.REFEREE_CLASS_NAMES})
         print(f"[init] detector={args.det_model} (task={det.task}) -> track classes "
               f"{ {i: det.names[i] for i in args.classes} }")
+        self.pitch_cfg = PitchConfig(length=args.pitch_size[0], width=args.pitch_size[1])
+        self.calib = None
+        if args.minimap:
+            pm, pnl = None, None
+            if args.calib == "pnlcalib":
+                from pipeline.calib_pnl import PnLCalibModel
+                if tuple(args.pitch_size) != (105.0, 68.0):
+                    print("[warn] PnLCalib dùng sân 105x68 cố định (theo SoccerNet) -> bỏ qua --pitch-size")
+                    self.pitch_cfg = PitchConfig()
+                kp_w, ln_w = models_dir / config.PNL_KP_FILE, models_dir / config.PNL_LINE_FILE
+                missing = [str(p) for p in (kp_w, ln_w) if not p.exists()]
+                if missing:
+                    raise SystemExit(f"Không có weights PnLCalib {missing}. Chạy `python download_models.py`.")
+                pnl = PnLCalibModel(kp_w, ln_w, self.device, refine_lines=args.pnl_refine)
+                desc = f"PnLCalib ({kp_w.name}, {ln_w.name}, refine={args.pnl_refine})"
+            else:
+                pm = Path(args.pitch_model) if args.pitch_model else models_dir / config.PITCH_FILE
+                if not pm.exists():
+                    raise SystemExit(f"Không có model pitch {pm}. Chạy `python download_models.py` "
+                                     f"hoặc truyền --pitch-model.")
+                desc = f"Roboflow 32 điểm ({pm})"
+            self.calib = PitchCalibrator(
+                pm, self.device, self.pitch_cfg, imgsz=config.PITCH_IMGSZ, det_conf=config.PITCH_DET_CONF,
+                kpt_conf=args.pitch_kpt_conf, ransac_m=config.PITCH_RANSAC_M,
+                max_reproj_m=config.PITCH_MAX_REPROJ_M, max_jump_m=config.PITCH_MAX_JUMP_M,
+                ema=config.PITCH_EMA, max_flow_frames=config.PITCH_MAX_FLOW_FRAMES,
+                # switch_after tính theo số lần đo -> quy đổi để luôn ~PITCH_SWITCH_AFTER frame
+                switch_after=max(3, -(-config.PITCH_SWITCH_AFTER // max(args.pitch_every, 1))),
+                pnl=pnl, max_reproj_px=config.PNL_MAX_REPROJ_PX)
+            print(f"[init] minimap: {desc}, sân {self.pitch_cfg.length:g}x{self.pitch_cfg.width:g} m, "
+                  f"mỗi {args.pitch_every} frame, reset tracker ở cắt cảnh={args.reset_on_cut}")
         if args.torso_mode == "bbox":
             self.pose = None
             print(f"[init] torso-mode=bbox (không dùng pose), ratio={tuple(args.torso_ratio)}")
@@ -97,11 +182,28 @@ class PlayerJerseyPipeline:
         detector = YOLO(a.det_model)  # model mới cho mỗi video -> reset tracker
         yolo_kw = dict(conf=a.conf, imgsz=a.imgsz, classes=a.classes, device=self.device, verbose=False)
         voter = TrackletVoter(config.FILTER_THRESHOLD, a.sum_th, config.USE_BIAS)
-        frame_log = []            # [(frame_idx, track_id, x1, y1, x2, y2, det_conf)]
+        # [(frame_idx, track_id, x1, y1, x2, y2, det_conf, cls, shot_id, x_m, y_m, h_status)]
+        frame_log = []
         span = {}                 # track_id -> [first_frame, last_frame]
         stats = defaultdict(lambda: {"attempts": 0, "legible": 0, "no_pose": 0})
+        shots = ShotDetector() if (a.minimap or a.reset_on_cut) else None
+        if self.calib is not None:
+            self.calib.reset()
+        geo = {"homs": {}, "shots": 0, "status": defaultdict(int), "err_m": [], "err_px": [],
+               "projected": 0, "outside": 0, "cut_off": 0, "players": 0}
+        shot_id, shot_start, id_offset, max_id = 0, 0, 0, 0
 
         for idx, frame in tqdm(timed_frames(frames, prof), total=total, desc="analyse"):
+            is_cut = False
+            if shots is not None:
+                with prof("2a. shot detect", n_items=1):
+                    is_cut = shots.update(frame)
+                shot_id = shots.shot_id
+                if is_cut:
+                    shot_start = idx
+                    if a.reset_on_cut and idx > 0:
+                        reset_tracker(detector)
+                        id_offset = max_id
             with prof("2. detect+track", n_items=1):
                 t0 = time.perf_counter()
                 r = detector.track(frame, persist=True, tracker=a.tracker, **yolo_kw)[0]
@@ -112,23 +214,50 @@ class PlayerJerseyPipeline:
             prof.add("   ├ yolo postprocess", sp.get("postprocess", 0))
             prof.add("   └ tracker (ByteTrack)", max(0.0, total_ms - sum(sp.get(k, 0) for k in
                                                                     ("preprocess", "inference", "postprocess"))))
-            if r.boxes is None or r.boxes.id is None:
-                continue
-            boxes = r.boxes.xyxy.cpu().numpy()
-            ids = r.boxes.id.int().cpu().numpy()
-            confs = r.boxes.conf.cpu().numpy()
-            kpts = r.keypoints.data.cpu().numpy() if self.det_is_pose and r.keypoints is not None else None
+            if r.boxes is not None and r.boxes.id is not None:
+                boxes = r.boxes.xyxy.cpu().numpy()
+                ids = r.boxes.id.int().cpu().numpy() + id_offset
+                confs = r.boxes.conf.cpu().numpy()
+                clss = r.boxes.cls.int().cpu().numpy()
+                kpts = r.keypoints.data.cpu().numpy() if self.det_is_pose and r.keypoints is not None else None
+                max_id = max(max_id, int(ids.max()))
+            else:
+                boxes, ids, confs, clss, kpts = np.zeros((0, 4)), np.zeros(0, int), np.zeros(0), np.zeros(0, int), None
 
-            for b, t, c in zip(boxes, ids, confs):
-                frame_log.append((idx, int(t), *[int(v) for v in b], float(c)))
+            # --- minimap: homography ảnh -> sân, chiếu chân cầu thủ (mọi frame, kể cả không có cầu thủ)
+            pos, status = [None] * len(boxes), ""
+            if self.calib is not None:
+                with prof("2b. pitch calib", n_items=1):
+                    run_model = (idx - shot_start) % max(a.pitch_every, 1) == 0
+                    H, status, info = self.calib.update(frame, is_cut, boxes, run_model=run_model)
+                if "model_ms" in info:
+                    prof.add("   ├ pitch keypoints", info["model_ms"])
+                pos = self._project_feet(H, boxes, frame.shape, geo)
+                geo["status"][status] += 1
+                if status == "kp" and "err_m" in info:
+                    geo["err_m"].append(info["err_m"])
+                if status == "kp" and "rep_err_px" in info:
+                    geo["err_px"].append(info["rep_err_px"])
+                dbg = None
+                if a.pitch_debug:
+                    dbg = {k: info[k] for k in ("kp_xy", "kp_conf", "n_kp", "n_lines", "n_inliers", "err_m",
+                                                "rep_err_px", "rejected") if k in info}
+                    dbg["shot"] = shot_id
+                geo["homs"][idx] = (H, status, dbg)
+
+            for b, t, c, cl, p in zip(boxes, ids, confs, clss, pos):
+                frame_log.append((idx, int(t), *[int(v) for v in b], float(c), int(cl), shot_id,
+                                  None if p is None else round(float(p[0]), 2),
+                                  None if p is None else round(float(p[1]), 2), status))
                 span.setdefault(int(t), [idx, idx])[1] = idx
 
-            if idx % a.stride:
+            if not len(boxes) or idx % a.stride:
                 continue
 
             # --- chọn cầu thủ cần đọc số ở frame này
             cand = [i for i, (b, t) in enumerate(zip(boxes, ids))
-                    if b[3] - b[1] >= a.min_box_height and stats[int(t)]["attempts"] < a.max_reads]
+                    if b[3] - b[1] >= a.min_box_height and stats[int(t)]["attempts"] < a.max_reads
+                    and int(clss[i]) in self.read_classes]
             if not cand:
                 continue
             if a.no_legibility:
@@ -185,41 +314,80 @@ class PlayerJerseyPipeline:
                     with prof("   save crops (debug)", n_items=1):
                         cv2.imwrite(str(crops_dir / f"t{tid:04d}_f{idx:06d}_{label or 'x'}_{prob:.2f}.jpg"), crop)
 
-        return voter, frame_log, span, stats
+        geo["shots"] = shots.shot_id + 1 if shots is not None else 1
+        return voter, frame_log, span, stats, geo
+
+    def _project_feet(self, H, boxes, shape, geo):
+        """Điểm chân (đáy-giữa bbox) -> toạ độ sân (m). None nếu không chiếu được / không tin được."""
+        pos = [None] * len(boxes)
+        geo["players"] += len(boxes)
+        if H is None or not len(boxes):
+            return pos
+        L, W, m = self.pitch_cfg.length, self.pitch_cfg.width, config.PITCH_OUTSIDE_M
+        feet = np.c_[(boxes[:, 0] + boxes[:, 2]) / 2, boxes[:, 3]]
+        xy, w = project(H, feet)
+        for k, ((x, y), ww) in enumerate(zip(xy, w)):
+            if boxes[k, 3] >= shape[0] - 2:            # chân bị cắt ở mép dưới frame -> điểm chân sai
+                geo["cut_off"] += 1
+            elif ww <= 0 or not np.isfinite([x, y]).all() or not (-m <= x <= L + m and -m <= y <= W + m):
+                geo["outside"] += 1
+            else:
+                pos[k] = (x, y)
+                geo["projected"] += 1
+        return pos
 
     # ------------------------------------------------------------------ pass 2
-    @staticmethod
-    def render(src, dst, frame_log, numbers, fps, size, max_frames, prof: StepTimer):
+    def render(self, src, dst, frame_log, numbers, roles, fps, size, prof: StepTimer, positions=None, geo=None):
+        a = self.args
         by_frame = defaultdict(list)
         for row in frame_log:
             by_frame[row[0]].append(row)
+        mm = MinimapRenderer(self.pitch_cfg, config.MINIMAP_WIDTH) if positions is not None else None
         tmp = dst.with_suffix(".tmp.mp4")
         t0 = time.perf_counter()
         n = 0
         writer = cv2.VideoWriter(str(tmp), cv2.VideoWriter_fourcc(*"mp4v"), fps, size)
-        for idx, frame in tqdm(read_frames(src, max_frames), total=None, desc="render"):
-            for _, tid, x1, y1, x2, y2, _ in by_frame.get(idx, []):
+        mm_tmp = dst.with_name(f"{src.stem}_minimap.tmp.mp4")
+        mm_writer = (cv2.VideoWriter(str(mm_tmp), cv2.VideoWriter_fourcc(*"mp4v"), fps, mm.size)
+                     if mm is not None and a.minimap_video else None)
+        last_dots, stale_n = [], 0
+        for idx, frame in tqdm(read_frames(src, a.max_frames), total=None, desc="render"):
+            rows = by_frame.get(idx, [])
+            H, status, dbg = (geo["homs"].get(idx) or (None, "none", None)) if geo else (None, "none", None)
+            if a.pitch_debug and geo is not None:
+                draw_debug(frame, self.pitch_cfg, H, status, dbg, a.pitch_kpt_conf)
+            for _, tid, x1, y1, x2, y2, *_ in rows:
                 num = numbers.get(tid, -1)
                 color = (0, 220, 0) if num > 0 else (160, 160, 160)
-                text = f"#{num}" if num > 0 else f"id{tid}"
+                text = f"#{num}" if num > 0 else ("ref" if roles.get(tid) == "referee" else f"id{tid}")
                 cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
                 (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
                 cv2.rectangle(frame, (x1, y1 - th - 6), (x1 + tw + 4, y1), color, -1)
                 cv2.putText(frame, text, (x1 + 2, y1 - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2)
+            if mm is not None:
+                dots = [(*positions[(idx, row[1])], roles.get(row[1], "player"), numbers.get(row[1], -1))
+                        for row in rows if (idx, row[1]) in positions]
+                if H is not None or dots:
+                    last_dots, stale_n = dots, 0
+                    view = mm.view_polygon(H, frame.shape) if H is not None else None
+                    img = mm.draw(dots, view=view, label=f"H: {status}" if a.pitch_debug else None)
+                else:                                   # close-up / khán đài / replay: giữ vị trí cuối, vẽ mờ
+                    stale_n += 1
+                    keep = last_dots if stale_n <= config.MINIMAP_STALE_FRAMES else []
+                    img = mm.draw(keep, stale=True, label="no pitch view")
+                overlay(frame, img, a.minimap_pos)
+                if mm_writer is not None:
+                    mm_writer.write(img)
             writer.write(frame)
             n += 1
         writer.release()
+        if mm_writer is not None:
+            mm_writer.release()
         prof.add("9. render video", (time.perf_counter() - t0) * 1000, n_items=n)
-        # mp4v không xem được trong trình duyệt/notebook -> chuyển sang H.264 nếu có ffmpeg
-        if shutil.which("ffmpeg"):
-            with prof("10. ffmpeg -> H.264", n_items=1):
-                subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-i", str(tmp), "-c:v", "libx264",
-                                "-pix_fmt", "yuv420p", "-preset", "fast", str(dst)], check=False)
-            if dst.exists():
-                tmp.unlink()
-                return dst
-        tmp.rename(dst)
-        return dst
+        out = [to_h264(tmp, dst, prof)]
+        if mm_writer is not None:
+            out.append(to_h264(mm_tmp, dst.with_name(f"{src.stem}_minimap.mp4"), prof))
+        return out
 
     # ------------------------------------------------------------------ run
     def process_video(self, src: Path, out_root: Path):
@@ -241,15 +409,20 @@ class PlayerJerseyPipeline:
 
         prof = StepTimer(self.device)
         t_start = time.perf_counter()
-        voter, frame_log, span, stats = self.analyse(read_frames(src, a.max_frames), total, prof, crops_dir)
+        voter, frame_log, span, stats, geo = self.analyse(read_frames(src, a.max_frames), total, prof, crops_dir)
         elapsed = time.perf_counter() - t_start
 
         t_agg = time.perf_counter()
+        cls_votes = defaultdict(lambda: defaultdict(int))     # class của track = class xuất hiện nhiều nhất
+        for row in frame_log:
+            cls_votes[row[1]][row[7]] += 1
+        roles = {t: role_of(self.class_names[max(v, key=v.get)]) for t, v in cls_votes.items()}
         tracks, numbers = {}, {}
         for tid in sorted(span):
             num, weight = voter.best(tid)
             numbers[tid] = num
             tracks[tid] = {
+                "role": roles.get(tid, "player"),
                 "jersey_number": num,
                 "weight": round(weight, 3),
                 "votes": {str(k): round(v, 3) for k, v in sorted(voter.weights(tid).items(), key=lambda kv: -kv[1])},
@@ -260,14 +433,35 @@ class PlayerJerseyPipeline:
             }
         prof.add("7. aggregate (vote)", (time.perf_counter() - t_agg) * 1000, n_items=len(span))
 
+        positions, mm_summary = None, None
+        if a.minimap:
+            with prof("7b. smooth positions", n_items=len(frame_log)):
+                positions = smooth_positions([(r[0], (r[1], r[8]), r[9], r[10]) for r in frame_log])
+            mm_summary = minimap_summary(geo)
+
         t_out = time.perf_counter()
         with open(out_dir / "tracks.json", "w") as f:
-            json.dump({"source": str(src), "fps": fps, "tracks": tracks}, f, indent=2)
+            json.dump({"source": str(src), "fps": fps, "shots": geo["shots"], "minimap": mm_summary,
+                       "tracks": tracks}, f, indent=2)
         with open(out_dir / "detections.csv", "w", newline="") as f:
             w = csv.writer(f)
-            w.writerow(["frame", "track_id", "x1", "y1", "x2", "y2", "det_conf", "jersey_number"])
+            w.writerow(["frame", "track_id", "x1", "y1", "x2", "y2", "det_conf", "jersey_number",
+                        "class", "shot_id", "x_m", "y_m", "h_status"])
             for row in frame_log:
-                w.writerow([*row[:6], f"{row[6]:.3f}", numbers.get(row[1], -1)])
+                w.writerow([*row[:6], f"{row[6]:.3f}", numbers.get(row[1], -1), self.class_names[row[7]],
+                            row[8], "" if row[9] is None else row[9], "" if row[10] is None else row[10],
+                            row[11]])
+        if positions is not None:
+            # vị trí đã làm mượt, chỉ những frame chiếu được; toạ độ (0,0) = góc sân, x dọc chiều dài
+            status = {f: h[1] for f, h in geo["homs"].items()}
+            with open(out_dir / "positions.csv", "w", newline="") as f:
+                w = csv.writer(f)
+                w.writerow(["frame", "track_id", "role", "jersey_number", "shot_id", "h_status", "x_m", "y_m"])
+                for row in frame_log:
+                    p = positions.get((row[0], row[1]))
+                    if p is not None:
+                        w.writerow([row[0], row[1], roles.get(row[1], "player"), numbers.get(row[1], -1),
+                                    row[8], status.get(row[0], ""), f"{p[0]:.2f}", f"{p[1]:.2f}"])
         prof.add("8. write json/csv", (time.perf_counter() - t_out) * 1000)
 
         n_frames = len(prof.calls.get("2. detect+track", []))
@@ -277,22 +471,63 @@ class PlayerJerseyPipeline:
         for t, n in sorted(identified.items(), key=lambda kv: kv[1]):
             print(f"    track {t:>4}: #{n:<3} (weight {tracks[t]['weight']}, frames {span[t][0]}-{span[t][1]})")
 
+        if mm_summary is not None:
+            s = mm_summary
+            print(f"  minimap: {geo['shots']} shot | frame có phép chiếu: kp {s['pct_kp']}%, flow {s['pct_flow']}%, "
+                  f"không có {s['pct_none']}% | lỗi reprojection trung vị "
+                  + (f"{s['median_err_px']} px" if s['median_err_px'] is not None else f"{s['median_err_m']} m"))
+            print(f"           cầu thủ chiếu lên sân được: {s['pct_projected']}% "
+                  f"(ngoài sân -> bỏ {s['pct_outside']}%, chân bị cắt ở mép frame {s['pct_cut_off']}%)")
+        elif geo["shots"] > 1:
+            print(f"  shots: {geo['shots']} (tracker reset ở mỗi cắt cảnh)")
+
         if not a.no_video:
-            path = self.render(src, out_dir / f"{src.stem}_jersey.mp4", frame_log, numbers, fps, size,
-                               a.max_frames, prof)
-            print(f"  video: {path}")
+            paths = self.render(src, out_dir / f"{src.stem}_jersey.mp4", frame_log, numbers, roles, fps, size,
+                                prof, positions, geo if a.minimap else None)
+            for path in paths:
+                print(f"  video: {path}")
         print(f"  json:  {out_dir / 'tracks.json'}")
+        if positions is not None:
+            print(f"  positions: {out_dir / 'positions.csv'}")
 
         timing = prof.summary(n_frames, time.perf_counter() - t_start)
         timing["analyse_fps"] = round(n_frames / max(elapsed, 1e-9), 2)
         timing["config"] = {"det_model": a.det_model, "torso_mode": a.torso_mode,
                             "pose_model": None if (self.det_is_pose or a.torso_mode == "bbox") else a.pose_model,
-                            "imgsz": a.imgsz, "stride": a.stride, "no_legibility": a.no_legibility}
+                            "imgsz": a.imgsz, "stride": a.stride, "no_legibility": a.no_legibility,
+                            "minimap": a.minimap, "pitch_every": a.pitch_every if a.minimap else None,
+                            "reset_on_cut": a.reset_on_cut}
         StepTimer.print_table(timing)
         print(f"  analyse (pass 1, không tính render): {timing['analyse_fps']} fps")
         with open(out_dir / "timing.json", "w") as f:
             json.dump(timing, f, indent=2, ensure_ascii=False)
         print(f"  timing: {out_dir / 'timing.json'}")
+
+
+def minimap_summary(geo) -> dict:
+    n = max(sum(geo["status"].values()), 1)
+    p = max(geo["players"], 1)
+    pct = lambda v, d: round(100 * v / d, 1)  # noqa: E731
+    return {"shots": geo["shots"],
+            "pct_kp": pct(geo["status"]["kp"], n), "pct_flow": pct(geo["status"]["flow"], n),
+            "pct_none": pct(geo["status"]["none"], n),
+            "median_err_m": round(float(np.median(geo["err_m"])), 3) if geo["err_m"] else None,
+            "median_err_px": round(float(np.median(geo["err_px"])), 2) if geo["err_px"] else None,
+            "pct_projected": pct(geo["projected"], p), "pct_outside": pct(geo["outside"], p),
+            "pct_cut_off": pct(geo["cut_off"], p)}
+
+
+def to_h264(tmp: Path, dst: Path, prof: StepTimer) -> Path:
+    """mp4v không xem được trong trình duyệt/notebook -> chuyển sang H.264 nếu có ffmpeg."""
+    if shutil.which("ffmpeg"):
+        with prof("10. ffmpeg -> H.264", n_items=1):
+            subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-i", str(tmp), "-c:v", "libx264",
+                            "-pix_fmt", "yuv420p", "-preset", "fast", str(dst)], check=False)
+        if dst.exists():
+            tmp.unlink()
+            return dst
+    tmp.rename(dst)
+    return dst
 
 
 def resolve_classes(names: dict, spec) -> list:
