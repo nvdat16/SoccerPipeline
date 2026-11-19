@@ -13,6 +13,7 @@ video ─► yolo26s-soccer (detect player + goalkeeper)
            crop thân áo theo tỉ lệ bbox   (hoặc theo vai/hông với --torso-mode pose)
            PARSeq đọc số (0-99) + xác suất
       ─► bỏ phiếu theo track (cộng xác suất, ưu tiên số 2 chữ số)
+      ─► chia đội: histogram màu thân áo ─► KMeans 2 cụm ─► nhãn đội theo frame
       ─► video có nhãn + tracks.json + detections.csv
 ```
 
@@ -81,9 +82,37 @@ So sánh trên `liver-mu.mp4` (2500 frame, M1 Pro):
 | `--torso-ratio` | `0.22 0.20 0.78 0.52` | vùng thân áo (x1 y1 x2 y2) theo tỉ lệ bbox, dùng với `--torso-mode bbox` |
 | `--no-legibility` | off | bỏ legibility, đọc số mọi cầu thủ (debug) |
 | `--save-crops` | off | lưu crop thân áo kèm số đọc được |
+| `--teams` / `--no-teams` | on | chia 2 đội theo màu áo (xem [Chia đội](#chia-đội)) |
 
 Với `--torso-mode pose`: nếu `--det-model` không phải model pose (ví dụ `yolo26s-soccer.pt`), pipeline chạy thêm
 `--pose-model` (mặc định `yolo26n-pose.pt`) để lấy keypoints rồi ghép với bbox theo IoU.
+
+## Chia đội
+
+Không cần model hay train. Chạy mặc định, tắt bằng `--no-teams`. Tham số `TEAM_*` nằm trong `config.py`.
+
+1. Mỗi `--stride` frame, với mỗi cầu thủ cao từ 30 px: lấy vùng thân áo (`TEAM_BBOX_RATIO`) rồi tính histogram
+   HSV 21 chiều (18 bin hue cho pixel có màu, 3 bin đen/xám/trắng), bỏ pixel cỏ.
+2. Hết video: KMeans 2 cụm trên mẫu của mọi track `player` (tối đa 30 mẫu/track). Đội A là cụm đông hơn.
+3. Gán đội **cho từng mẫu**: mẫu xa cả 2 tâm cụm (median + 4·MAD) bị coi là màu lạ, ví dụ trọng tài bị detect
+   thành player. Sau đó làm mượt trong track (đa số ±4 mẫu). Mỗi frame lấy nhãn của mẫu gần nhất.
+   Gán theo frame vì ByteTrack hay **đổi ID** giữa 2 cầu thủ khác đội khi họ chạm nhau. `team_switches` trong
+   `tracks.json` đếm số lần như vậy.
+4. Track mà detector gọi là `goalkeeper` nhưng áo khớp màu một đội (≥ 70% mẫu) thực ra là cầu thủ bị nhận nhầm
+   class: đổi role thành `player` và gán đội theo màu.
+
+Video: bbox và chấm minimap tô bằng **màu áo thật** của đội, nhãn `A #10` / `B id42`. Thủ môn thật hiện `GK` màu vàng.
+
+Trên `liver-mu` (clip 1500 frame, Liverpool đỏ / MU trắng): 2 cụm "đỏ + cam" / "trắng + xám". 94% detection
+cầu thủ có đội. Các track bị đổi ID (trắng → đỏ giữa chừng) được tách đúng theo frame.
+
+Giới hạn:
+- **Thủ môn thật không có đội** (`team = -1`). Đã thử gán theo vị trí (cầu thủ sâu nhất, trọng tâm đội, số
+  cầu thủ gần khung thành) nhưng đều sai khi một đội tấn công liên tục trong clip.
+- Hai đội mặc áo gần màu nhau (ví dụ đỏ và cam, xanh đậm và đen) thì histogram dễ lẫn. Khi đó cần embedding
+  (SigLIP/CLIP).
+- Áo xanh lá: pixel cỏ bị bỏ, nên chỉ nhận được nếu hơn 70% crop là màu xanh lá.
+- Hai cầu thủ chồng nhau: crop thân áo lẫn màu của người phía sau.
 
 ## Minimap 2D
 
@@ -146,12 +175,14 @@ Giới hạn:
 - Góc máy lạ (tactical cam, sau khung thành) có thể không nhận ra.
 
 ## Output (`outputs/<tên video>/`)
-- `<tên>_jersey.mp4`: bbox xanh kèm `#số` khi đã nhận ra số áo, xám kèm `idN` khi chưa (+ minimap nếu `--minimap`)
-- `tracks.json`: mỗi track gồm `role`, `jersey_number` (-1 nếu không đọc được), `votes`, `attempts`, `legible`,
-  `str_reads`; thêm `shots` và (với `--minimap`) thống kê `minimap`
-- `detections.csv`: `frame, track_id, x1, y1, x2, y2, det_conf, jersey_number, class, shot_id, x_m, y_m, h_status`
-  (`x_m, y_m` thô, chưa làm mượt; `h_status` = `kp` | `flow` | `none`)
-- `positions.csv` (`--minimap`): `frame, track_id, role, jersey_number, shot_id, h_status, x_m, y_m` đã làm mượt
+- `<tên>_jersey.mp4`: bbox màu đội kèm `A #số` / `B idN`. Track chưa rõ đội: xanh nếu có số, xám nếu chưa.
+  Thủ môn: `GK` màu vàng. Thêm minimap nếu bật `--minimap`.
+- `tracks.json`: mỗi track gồm `role`, `team` (đội chiếm đa số, 0 = A | 1 = B | -1), `team_conf`, `team_switches`,
+  `jersey_number` (-1 nếu không đọc được), `votes`, `attempts`, `legible`, `str_reads`. Thêm `shots`, `teams`
+  (màu BGR và màu chủ đạo của mỗi đội), và thống kê `minimap` nếu bật `--minimap`.
+- `detections.csv`: `frame, track_id, x1, y1, x2, y2, det_conf, jersey_number, class, team, shot_id, x_m, y_m,
+  h_status`. `team` tính theo frame. `x_m, y_m` là giá trị thô, chưa làm mượt. `h_status` = `kp` | `flow` | `none`.
+- `positions.csv` (`--minimap`): `frame, track_id, role, team, jersey_number, shot_id, h_status, x_m, y_m`, đã làm mượt
 - `timing.json`: thời gian suy luận từng bước (decode, detect+track, legibility, pose, crop, PARSeq, vote, render)
 
 ## Cấu trúc
@@ -172,6 +203,7 @@ pipeline/
   shots.py              # phát hiện cắt cảnh
   pitch.py              # 32 điểm mốc sân -> homography ảnh->sân, kiểm tra, optical flow
   minimap.py            # vẽ minimap, làm mượt vị trí, overlay debug
+  team.py               # chia đội: histogram màu áo + KMeans, nhãn đội theo frame
   calib_pnl.py          # backend PnLCalib (HRNet điểm + vạch) -> homography
   device.py
 third_party/parseq/     # code strhub (PARSeq, Apache-2.0), vendor từ jersey-number-pipeline

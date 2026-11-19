@@ -5,8 +5,9 @@ import cv2
 import numpy as np
 
 from pipeline.pitch import PitchConfig, pitch_lines, project
+from pipeline.team import text_ink
 
-# BGR. Chưa chia đội -> màu theo vai trò.
+# BGR. Chưa chia đội (hoặc track chưa rõ đội) -> màu theo vai trò; có đội -> màu áo của đội (palette).
 COLORS = {
     "player": (255, 255, 255),        # trắng, chữ đen
     "player_unknown": (190, 190, 190),
@@ -18,8 +19,9 @@ LINE = (235, 235, 235)
 
 
 class MinimapRenderer:
-    def __init__(self, cfg: PitchConfig, width=420, margin_m=3.0):
+    def __init__(self, cfg: PitchConfig, width=420, margin_m=3.0, palette=None):
         self.cfg = cfg
+        self.palette = palette or {}                                    # đội -> BGR
         self.margin = margin_m
         self.scale = width / (cfg.length + 2 * margin_m)              # px / mét
         self.size = (width, int(round((cfg.width + 2 * margin_m) * self.scale)))
@@ -52,7 +54,8 @@ class MinimapRenderer:
         return None
 
     def draw(self, dots, view=None, stale=False, label=None):
-        """dots: [(x_m, y_m, role, number)]. role: player | goalkeeper | referee. number <= 0 = chưa biết.
+        """dots: [(x_m, y_m, role, number[, team])]. role: player | goalkeeper | referee. number <= 0 = chưa biết.
+        team: 0 | 1 | -1 (chưa rõ). Thủ môn có đội: nền vàng, viền màu đội.
         stale=True: frame hiện tại không có phép chiếu -> vẽ mờ vị trí cuối cùng đã biết."""
         img = self.base.copy()
         if view is not None:
@@ -61,17 +64,24 @@ class MinimapRenderer:
             img = cv2.addWeighted(over, 0.5, img, 0.5, 0)
             cv2.polylines(img, [self.to_px(view)], True, (120, 200, 120), 1, cv2.LINE_AA)
         r = self.radius
-        for x, y, role, number in dots:
+        for x, y, role, number, *rest in dots:
+            team = rest[0] if rest else -1
             px, py = (int(v) for v in self.to_px([(x, y)])[0])
-            key = "player_unknown" if role == "player" and number <= 0 else role
-            color = COLORS.get(key, COLORS["player"])
+            team_color = self.palette.get(team)
+            if team_color is not None and role == "player":
+                color = team_color
+            else:
+                key = "player_unknown" if role == "player" and number <= 0 else role
+                color = COLORS.get(key, COLORS["player"])
             cv2.circle(img, (px, py), r, color, -1, cv2.LINE_AA)
-            cv2.circle(img, (px, py), r, (0, 0, 0), 1, cv2.LINE_AA)
+            if team_color is not None and role == "goalkeeper":
+                cv2.circle(img, (px, py), r, team_color, 2, cv2.LINE_AA)
+            cv2.circle(img, (px, py), r + (1 if role == "goalkeeper" else 0), (0, 0, 0), 1, cv2.LINE_AA)
             if number > 0:
                 text = str(number)
                 fs = 0.32 if len(text) == 1 else 0.28
                 (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, fs, 1)
-                ink = (255, 255, 255) if role == "referee" else (0, 0, 0)
+                ink = text_ink(color)
                 cv2.putText(img, text, (px - tw // 2, py + th // 2), cv2.FONT_HERSHEY_SIMPLEX, fs, ink, 1,
                             cv2.LINE_AA)
         if stale:

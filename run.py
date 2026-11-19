@@ -9,7 +9,8 @@ Các bước, mỗi frame:
      b. Lấy keypoints vai/hông (từ YOLO-pose) rồi cắt vùng thân áo.
      c. PARSeq đọc số trên crop thân áo.
   3. Hết video: gộp các lần đọc theo track (bỏ phiếu có trọng số) để ra 1 số áo / track.
-  4. Render video kết quả và xuất JSON/CSV.
+  4. Chia đội (--teams, mặc định bật): histogram màu thân áo lấy mẫu trong lúc chạy -> KMeans 2 cụm.
+  5. Render video kết quả và xuất JSON/CSV.
 
 Với --minimap, thêm mỗi frame: phát hiện cắt cảnh (reset tracker + phép chiếu), pitch keypoints ->
 homography ảnh->sân, chiếu chân cầu thủ lên sân (mét); cuối cùng làm mượt vị trí và vẽ minimap.
@@ -37,6 +38,7 @@ from pipeline.pitch import PitchCalibrator, PitchConfig, project
 from pipeline.profiler import StepTimer
 from pipeline.shots import ShotDetector
 from pipeline.str_recognizer import JerseyNumberRecognizer
+from pipeline.team import TeamClassifier, text_ink
 from pipeline.torso import match_pose_to_box, torso_box, torso_from_bbox
 
 VIDEO_EXTS = {".mp4", ".avi", ".mov", ".mkv", ".webm", ".m4v"}
@@ -72,6 +74,8 @@ def parse_args():
     ap.add_argument("--device", default="auto", help="auto | cuda | mps | cpu")
     ap.add_argument("--no-video", action="store_true", help="không render video kết quả")
     ap.add_argument("--save-crops", action="store_true", help="lưu crop thân áo + số đọc được (debug)")
+    ap.add_argument("--teams", action=argparse.BooleanOptionalAction, default=True,
+                    help="chia 2 đội theo màu áo (histogram HSV + KMeans), tô màu bbox/minimap theo đội")
 
     mm = ap.add_argument_group("minimap")
     mm.add_argument("--minimap", action=argparse.BooleanOptionalAction, default=False,
@@ -182,6 +186,8 @@ class PlayerJerseyPipeline:
         detector = YOLO(a.det_model)  # model mới cho mỗi video -> reset tracker
         yolo_kw = dict(conf=a.conf, imgsz=a.imgsz, classes=a.classes, device=self.device, verbose=False)
         voter = TrackletVoter(config.FILTER_THRESHOLD, a.sum_th, config.USE_BIAS)
+        teamer = TeamClassifier(config.TEAM_FIT_SAMPLES, config.TEAM_MIN_SAMPLES, config.TEAM_OUTLIER_MAD,
+                                config.TEAM_SMOOTH) if a.teams else None
         # [(frame_idx, track_id, x1, y1, x2, y2, det_conf, cls, shot_id, x_m, y_m, h_status)]
         frame_log = []
         span = {}                 # track_id -> [first_frame, last_frame]
@@ -254,6 +260,15 @@ class PlayerJerseyPipeline:
             if not len(boxes) or idx % a.stride:
                 continue
 
+            # --- mẫu màu áo để chia đội (mọi cầu thủ đủ lớn, không phụ thuộc legibility)
+            if teamer is not None:
+                with prof("5b. team color sample", n_items=1):
+                    for b, t, cl in zip(boxes, ids, clss):
+                        if b[3] - b[1] >= config.TEAM_MIN_BOX_HEIGHT and int(cl) in self.read_classes:
+                            tb = torso_from_bbox(b, frame.shape, config.TEAM_BBOX_RATIO)
+                            if tb is not None:
+                                teamer.add(int(t), idx, frame[tb[1]:tb[3], tb[0]:tb[2]])
+
             # --- chọn cầu thủ cần đọc số ở frame này
             cand = [i for i, (b, t) in enumerate(zip(boxes, ids))
                     if b[3] - b[1] >= a.min_box_height and stats[int(t)]["attempts"] < a.max_reads
@@ -315,7 +330,7 @@ class PlayerJerseyPipeline:
                         cv2.imwrite(str(crops_dir / f"t{tid:04d}_f{idx:06d}_{label or 'x'}_{prob:.2f}.jpg"), crop)
 
         geo["shots"] = shots.shot_id + 1 if shots is not None else 1
-        return voter, frame_log, span, stats, geo
+        return voter, frame_log, span, stats, geo, teamer
 
     def _project_feet(self, H, boxes, shape, geo):
         """Điểm chân (đáy-giữa bbox) -> toạ độ sân (m). None nếu không chiếu được / không tin được."""
@@ -337,12 +352,15 @@ class PlayerJerseyPipeline:
         return pos
 
     # ------------------------------------------------------------------ pass 2
-    def render(self, src, dst, frame_log, numbers, roles, fps, size, prof: StepTimer, positions=None, geo=None):
+    def render(self, src, dst, frame_log, numbers, roles, fps, size, prof: StepTimer, positions=None, geo=None,
+               team_of=None, palette=None):
+        """palette: đội -> màu BGR (màu áo thật của đội). Track có đội: bbox màu đội, viền dày nếu đã có số."""
         a = self.args
         by_frame = defaultdict(list)
         for row in frame_log:
             by_frame[row[0]].append(row)
-        mm = MinimapRenderer(self.pitch_cfg, config.MINIMAP_WIDTH) if positions is not None else None
+        team_of, palette = team_of or {}, palette or {}
+        mm = MinimapRenderer(self.pitch_cfg, config.MINIMAP_WIDTH, palette=palette) if positions is not None else None
         tmp = dst.with_suffix(".tmp.mp4")
         t0 = time.perf_counter()
         n = 0
@@ -358,15 +376,24 @@ class PlayerJerseyPipeline:
                 draw_debug(frame, self.pitch_cfg, H, status, dbg, a.pitch_kpt_conf)
             for _, tid, x1, y1, x2, y2, *_ in rows:
                 num = numbers.get(tid, -1)
-                color = (0, 220, 0) if num > 0 else (160, 160, 160)
-                text = f"#{num}" if num > 0 else ("ref" if roles.get(tid) == "referee" else f"id{tid}")
+                team = team_of.get((idx, tid), -1)
+                if team in palette:
+                    color = palette[team]
+                    text = f"{'AB'[team]} #{num}" if num > 0 else f"{'AB'[team]} id{tid}"
+                elif roles.get(tid) == "goalkeeper":
+                    color = (0, 215, 255)
+                    text = f"GK #{num}" if num > 0 else "GK"
+                else:
+                    color = (0, 220, 0) if num > 0 else (160, 160, 160)
+                    text = f"#{num}" if num > 0 else ("ref" if roles.get(tid) == "referee" else f"id{tid}")
+                cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 0, 0), 4)    # viền đen để thấy cả áo trắng/đen
                 cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
                 (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
                 cv2.rectangle(frame, (x1, y1 - th - 6), (x1 + tw + 4, y1), color, -1)
-                cv2.putText(frame, text, (x1 + 2, y1 - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2)
+                cv2.putText(frame, text, (x1 + 2, y1 - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.6, text_ink(color), 2)
             if mm is not None:
-                dots = [(*positions[(idx, row[1])], roles.get(row[1], "player"), numbers.get(row[1], -1))
-                        for row in rows if (idx, row[1]) in positions]
+                dots = [(*positions[(idx, row[1])], roles.get(row[1], "player"), numbers.get(row[1], -1),
+                         team_of.get(row[:2], -1)) for row in rows if (idx, row[1]) in positions]
                 if H is not None or dots:
                     last_dots, stale_n = dots, 0
                     view = mm.view_polygon(H, frame.shape) if H is not None else None
@@ -409,7 +436,7 @@ class PlayerJerseyPipeline:
 
         prof = StepTimer(self.device)
         t_start = time.perf_counter()
-        voter, frame_log, span, stats, geo = self.analyse(read_frames(src, a.max_frames), total, prof, crops_dir)
+        voter, frame_log, span, stats, geo, teamer = self.analyse(read_frames(src, a.max_frames), total, prof, crops_dir)
         elapsed = time.perf_counter() - t_start
 
         t_agg = time.perf_counter()
@@ -417,12 +444,22 @@ class PlayerJerseyPipeline:
         for row in frame_log:
             cls_votes[row[1]][row[7]] += 1
         roles = {t: role_of(self.class_names[max(v, key=v.get)]) for t, v in cls_votes.items()}
+        team_of, team_info = {}, None                 # (frame, track) -> đội 0 | 1 | -1
+        if teamer is not None:
+            t_team = time.perf_counter()
+            team_info = teamer.fit(roles)
+            if team_info["ok"]:
+                for t in teamer.as_player:            # detector gọi là goalkeeper nhưng áo đúng màu 1 đội
+                    roles[t] = "player"
+                team_of = {(r[0], r[1]): teamer.team_at(r[1], r[0]) for r in frame_log}
+            prof.add("7c. team clustering", (time.perf_counter() - t_team) * 1000, n_items=len(roles))
         tracks, numbers = {}, {}
         for tid in sorted(span):
             num, weight = voter.best(tid)
             numbers[tid] = num
             tracks[tid] = {
                 "role": roles.get(tid, "player"),
+                **(teamer.track_summary(tid) if team_of else {}),
                 "jersey_number": num,
                 "weight": round(weight, 3),
                 "votes": {str(k): round(v, 3) for k, v in sorted(voter.weights(tid).items(), key=lambda kv: -kv[1])},
@@ -442,32 +479,45 @@ class PlayerJerseyPipeline:
         t_out = time.perf_counter()
         with open(out_dir / "tracks.json", "w") as f:
             json.dump({"source": str(src), "fps": fps, "shots": geo["shots"], "minimap": mm_summary,
-                       "tracks": tracks}, f, indent=2)
+                       "teams": team_info, "tracks": tracks}, f, indent=2)
         with open(out_dir / "detections.csv", "w", newline="") as f:
             w = csv.writer(f)
             w.writerow(["frame", "track_id", "x1", "y1", "x2", "y2", "det_conf", "jersey_number",
-                        "class", "shot_id", "x_m", "y_m", "h_status"])
+                        "class", "team", "shot_id", "x_m", "y_m", "h_status"])
             for row in frame_log:
                 w.writerow([*row[:6], f"{row[6]:.3f}", numbers.get(row[1], -1), self.class_names[row[7]],
-                            row[8], "" if row[9] is None else row[9], "" if row[10] is None else row[10],
-                            row[11]])
+                            team_of.get(row[:2], -1), row[8], "" if row[9] is None else row[9],
+                            "" if row[10] is None else row[10], row[11]])
         if positions is not None:
             # vị trí đã làm mượt, chỉ những frame chiếu được; toạ độ (0,0) = góc sân, x dọc chiều dài
             status = {f: h[1] for f, h in geo["homs"].items()}
             with open(out_dir / "positions.csv", "w", newline="") as f:
                 w = csv.writer(f)
-                w.writerow(["frame", "track_id", "role", "jersey_number", "shot_id", "h_status", "x_m", "y_m"])
+                w.writerow(["frame", "track_id", "role", "team", "jersey_number", "shot_id", "h_status",
+                            "x_m", "y_m"])
                 for row in frame_log:
                     p = positions.get((row[0], row[1]))
                     if p is not None:
-                        w.writerow([row[0], row[1], roles.get(row[1], "player"), numbers.get(row[1], -1),
-                                    row[8], status.get(row[0], ""), f"{p[0]:.2f}", f"{p[1]:.2f}"])
+                        w.writerow([row[0], row[1], roles.get(row[1], "player"), team_of.get(row[:2], -1),
+                                    numbers.get(row[1], -1), row[8], status.get(row[0], ""), f"{p[0]:.2f}", f"{p[1]:.2f}"])
         prof.add("8. write json/csv", (time.perf_counter() - t_out) * 1000)
 
         n_frames = len(prof.calls.get("2. detect+track", []))
         identified = {t: n for t, n in numbers.items() if n > 0}
         print(f"\n[{src.name}] {n_frames} frames, {elapsed:.1f}s ({n_frames / max(elapsed, 1e-6):.1f} fps)")
         print(f"  tracks: {len(tracks)}, có số áo: {len(identified)}")
+        if team_info is not None:
+            if team_info["ok"]:
+                for d in team_info["teams"]:
+                    print(f"  đội {'AB'[d['team']]}: {d['n_tracks']} track cầu thủ, màu {d['dominant']} "
+                          f"(BGR {d['color_bgr']})")
+                det_p = [k for (f, t), k in team_of.items() if roles.get(t) == "player"]
+                n_sw = sum(1 for t in tracks if tracks[t].get("team_switches", 0) > 0)
+                print(f"    detection cầu thủ chưa rõ đội: {100 * det_p.count(-1) / max(len(det_p), 1):.1f}% | "
+                      f"track đổi đội giữa chừng (đổi ID): {n_sw} | track 'goalkeeper' thực ra là cầu thủ "
+                      f"(áo khớp màu đội): {team_info['n_goalkeeper_as_player']}")
+            else:
+                print(f"  chia đội: bỏ qua ({team_info['reason']})")
         for t, n in sorted(identified.items(), key=lambda kv: kv[1]):
             print(f"    track {t:>4}: #{n:<3} (weight {tracks[t]['weight']}, frames {span[t][0]}-{span[t][1]})")
 
@@ -482,8 +532,10 @@ class PlayerJerseyPipeline:
             print(f"  shots: {geo['shots']} (tracker reset ở mỗi cắt cảnh)")
 
         if not a.no_video:
+            palette = ({k: tuple(d["color_bgr"]) for k, d in enumerate(team_info["teams"])}
+                       if team_info and team_info["ok"] else {})
             paths = self.render(src, out_dir / f"{src.stem}_jersey.mp4", frame_log, numbers, roles, fps, size,
-                                prof, positions, geo if a.minimap else None)
+                                prof, positions, geo if a.minimap else None, team_of, palette)
             for path in paths:
                 print(f"  video: {path}")
         print(f"  json:  {out_dir / 'tracks.json'}")
@@ -496,7 +548,7 @@ class PlayerJerseyPipeline:
                             "pose_model": None if (self.det_is_pose or a.torso_mode == "bbox") else a.pose_model,
                             "imgsz": a.imgsz, "stride": a.stride, "no_legibility": a.no_legibility,
                             "minimap": a.minimap, "pitch_every": a.pitch_every if a.minimap else None,
-                            "reset_on_cut": a.reset_on_cut}
+                            "reset_on_cut": a.reset_on_cut, "teams": a.teams}
         StepTimer.print_table(timing)
         print(f"  analyse (pass 1, không tính render): {timing['analyse_fps']} fps")
         with open(out_dir / "timing.json", "w") as f:

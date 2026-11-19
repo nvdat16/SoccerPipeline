@@ -87,3 +87,12 @@ MINIMAP_WIDTH = 420                     # px
 MINIMAP_POS = "bottom-right"            # bottom-left | bottom-center | bottom-right | top-left | ...
 MINIMAP_STALE_FRAMES = 75               # frame không có phép chiếu: giữ chấm mờ tối đa N frame (~3 s)
 REFEREE_CLASS_NAMES = ["referee"]       # --minimap: track thêm trọng tài (vẽ màu đen, không đọc số)
+
+# ---------------------------------------------------------------- chia đội (--teams)
+# Histogram HSV vùng thân áo -> KMeans 2 cụm trên mọi track 'player' -> bỏ phiếu theo track.
+TEAM_BBOX_RATIO = (0.25, 0.15, 0.75, 0.50)  # vùng thân áo lấy màu (tỉ lệ bbox), hẹp để ít cỏ
+TEAM_MIN_BOX_HEIGHT = 30                # cầu thủ nhỏ hơn N px không lấy mẫu màu
+TEAM_FIT_SAMPLES = 30                   # KMeans dùng tối đa N mẫu / track (mỗi --stride frame lấy 1 mẫu)
+TEAM_MIN_SAMPLES = 3                    # track ít mẫu hơn không dùng để fit (vẫn được gán đội)
+TEAM_OUTLIER_MAD = 4.0                  # mẫu xa tâm đội > median + N*MAD -> màu lạ, team = -1
+TEAM_SMOOTH = 4                         # làm mượt nhãn đội: đa số trong ±N mẫu của cùng track
