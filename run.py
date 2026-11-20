@@ -32,12 +32,14 @@ from ultralytics import YOLO
 import config
 from pipeline.aggregator import TrackletVoter
 from pipeline.device import pick_device
+from pipeline.identity import IdentityLinker
 from pipeline.legibility import LegibilityModel
 from pipeline.minimap import MinimapRenderer, draw_debug, overlay, smooth_positions
 from pipeline.pitch import PitchCalibrator, PitchConfig, project
 from pipeline.profiler import StepTimer
 from pipeline.shots import ShotDetector
 from pipeline.str_recognizer import JerseyNumberRecognizer
+from pipeline.tiling import OwnTracker, tiled_detect
 from pipeline.team import TeamClassifier, text_ink
 from pipeline.torso import match_pose_to_box, torso_box, torso_from_bbox
 
@@ -55,9 +57,14 @@ def parse_args():
     ap.add_argument("--classes", nargs="+", default=None,
                     help="class của cầu thủ, theo id hoặc tên (vd: '1 2' hoặc 'player goalkeeper'). "
                          f"Mặc định: tự chọn các class có tên trong {config.PLAYER_CLASS_NAMES}")
-    ap.add_argument("--tracker", default=config.TRACKER, help="bytetrack.yaml | botsort.yaml")
+    ap.add_argument("--tracker", default=config.TRACKER,
+                    help="file yaml của tracker (mặc định trackers/bytetrack_soccer.yaml); "
+                         "trackers/botsort_soccer.yaml (thêm GMC) | bytetrack.yaml | botsort.yaml")
     ap.add_argument("--conf", type=float, default=config.DET_CONF)
     ap.add_argument("--imgsz", type=int, default=config.DET_IMGSZ)
+    ap.add_argument("--tile", action=argparse.BooleanOptionalAction, default=config.TILE,
+                    help=f"detect thêm trên lưới tile {config.TILE_GRID} ở vùng xa camera {config.TILE_REGION} "
+                         "để bắt cầu thủ nhỏ (chậm hơn; đo trước bằng tools/far_report.py --video)")
     ap.add_argument("--stride", type=int, default=config.FRAME_STRIDE)
     ap.add_argument("--min-box-height", type=int, default=config.MIN_BOX_HEIGHT)
     ap.add_argument("--legibility-th", type=float, default=config.LEGIBILITY_THRESHOLD)
@@ -74,6 +81,17 @@ def parse_args():
     ap.add_argument("--device", default="auto", help="auto | cuda | mps | cpu")
     ap.add_argument("--no-video", action="store_true", help="không render video kết quả")
     ap.add_argument("--save-crops", action="store_true", help="lưu crop thân áo + số đọc được (debug)")
+    ap.add_argument("--link", action=argparse.BooleanOptionalAction, default=True,
+                    help="(cần --minimap) nối các đoạn track thành 1 cầu thủ theo vị trí/vận tốc/hướng trên sân, "
+                         "truyền số áo đọc rõ sang các đoạn chưa đọc được")
+    ap.add_argument("--enc-split", action=argparse.BooleanOptionalAction, default=config.ENC_SPLIT,
+                    help="(--link) cắt track khi 2 đồng đội gặp nhau (< ENC_R m), quyết định lại ai là ai bằng "
+                         "chuyển động; số áo chỉ có nhờ nối qua lần gặp được đánh dấu 'uncertain'")
+    ap.add_argument("--link-solver", choices=["global", "greedy"], default=config.LINK_SOLVER,
+                    help="(--link) global: ghép Hungarian tối ưu toàn cục; greedy: tham lam theo chi phí (bản cũ)")
+    ap.add_argument("--reid", action=argparse.BooleanOptionalAction, default=config.REID,
+                    help="(--link) embedding ngoại hình OSNet để phân định cặp nối trong đám đông "
+                         f"(cần <models-dir>/{config.REID_FILE}); số áo truyền qua đó = 'uncertain'")
     ap.add_argument("--teams", action=argparse.BooleanOptionalAction, default=True,
                     help="chia 2 đội theo màu áo (histogram HSV + KMeans), tô màu bbox/minimap theo đội")
 
@@ -171,6 +189,19 @@ class PlayerJerseyPipeline:
                 pnl=pnl, max_reproj_px=config.PNL_MAX_REPROJ_PX)
             print(f"[init] minimap: {desc}, sân {self.pitch_cfg.length:g}x{self.pitch_cfg.width:g} m, "
                   f"mỗi {args.pitch_every} frame, reset tracker ở cắt cảnh={args.reset_on_cut}")
+        self.reid = None
+        if args.reid and args.minimap and args.link:
+            from pipeline.reid import OSNetEmbedder
+            rw = models_dir / config.REID_FILE
+            if not rw.exists():
+                raise SystemExit(f"Không có weights re-ID {rw}. Chạy `python download_models.py`.")
+            self.reid = OSNetEmbedder(rw, self.device)
+            print(f"[init] re-ID: OSNet-AIN ({rw.name}), box >= {config.REID_MIN_BOX_HEIGHT}px, mỗi {args.stride} frame")
+        if args.tile and self.det_is_pose and args.torso_mode == "pose":
+            raise SystemExit("--tile chưa hỗ trợ lấy keypoint từ detector pose: dùng --torso-mode bbox")
+        if args.tile:
+            print(f"[init] tile: lưới {config.TILE_GRID}, vùng {config.TILE_REGION}, phóng to x{config.TILE_UPSCALE}, "
+                  f"chỉ thêm box < {config.TILE_MAX_H}px")
         if args.torso_mode == "bbox":
             self.pose = None
             print(f"[init] torso-mode=bbox (không dùng pose), ratio={tuple(args.torso_ratio)}")
@@ -190,14 +221,18 @@ class PlayerJerseyPipeline:
                                 config.TEAM_SMOOTH) if a.teams else None
         # [(frame_idx, track_id, x1, y1, x2, y2, det_conf, cls, shot_id, x_m, y_m, h_status)]
         frame_log = []
+        read_log = []             # [(frame_idx, track_id, label, prob)] mọi lần PARSeq đọc
         span = {}                 # track_id -> [first_frame, last_frame]
         stats = defaultdict(lambda: {"attempts": 0, "legible": 0, "no_pose": 0})
         shots = ShotDetector() if (a.minimap or a.reset_on_cut) else None
         if self.calib is not None:
             self.calib.reset()
         geo = {"homs": {}, "shots": 0, "status": defaultdict(int), "err_m": [], "err_px": [],
-               "projected": 0, "outside": 0, "cut_off": 0, "players": 0}
+               "projected": 0, "outside": 0, "cut_off": 0, "players": 0,
+               "motion": {}, "shot_of": {}, "shape": None, "emb": {}}
         shot_id, shot_start, id_offset, max_id = 0, 0, 0, 0
+        own = OwnTracker(a.tracker) if a.tile else None   # --tile: tự gọi tracker với detection đã gộp full + tile
+        geo["tile_extra"] = 0
 
         for idx, frame in tqdm(timed_frames(frames, prof), total=total, desc="analyse"):
             is_cut = False
@@ -208,19 +243,48 @@ class PlayerJerseyPipeline:
                 if is_cut:
                     shot_start = idx
                     if a.reset_on_cut and idx > 0:
-                        reset_tracker(detector)
+                        if own is not None:
+                            own.reset()
+                        else:
+                            reset_tracker(detector)
                         id_offset = max_id
+            tile_ms = 0.0
             with prof("2. detect+track", n_items=1):
                 t0 = time.perf_counter()
-                r = detector.track(frame, persist=True, tracker=a.tracker, **yolo_kw)[0]
+                if own is None:
+                    r = detector.track(frame, persist=True, tracker=a.tracker, **yolo_kw)[0]
+                else:
+                    r = detector.predict(frame, **yolo_kw)[0]
+                    full = ((r.boxes.xyxy.cpu().numpy(), r.boxes.conf.cpu().numpy(), r.boxes.cls.cpu().numpy())
+                            if r.boxes is not None else (np.zeros((0, 4)), np.zeros(0), np.zeros(0)))
+                    t1 = time.perf_counter()
+                    tb, tc, tk, n_extra = tiled_detect(
+                        detector, frame, None, a.conf, a.classes, self.device, grid=config.TILE_GRID,
+                        overlap=config.TILE_OVERLAP, region=config.TILE_REGION, full=full, ios_th=config.TILE_IOS,
+                        max_h=config.TILE_MAX_H, upscale=config.TILE_UPSCALE)
+                    tile_ms = (time.perf_counter() - t1) * 1000
+                    geo["tile_extra"] += n_extra
+                    tracks_arr = own.update(tb, tc, tk, frame)
                 total_ms = (time.perf_counter() - t0) * 1000
             sp = r.speed  # ms, ultralytics tự đo
             prof.add("   ├ yolo preprocess", sp.get("preprocess", 0))
             prof.add("   ├ yolo inference", sp.get("inference", 0))
             prof.add("   ├ yolo postprocess", sp.get("postprocess", 0))
-            prof.add("   └ tracker (ByteTrack)", max(0.0, total_ms - sum(sp.get(k, 0) for k in
-                                                                    ("preprocess", "inference", "postprocess"))))
-            if r.boxes is not None and r.boxes.id is not None:
+            if own is not None:
+                prof.add("   ├ tile detect", tile_ms)
+            prof.add("   └ tracker", max(0.0, total_ms - tile_ms - sum(sp.get(k, 0) for k in
+                                                                     ("preprocess", "inference", "postprocess"))))
+            if own is not None:
+                if len(tracks_arr):
+                    boxes = tracks_arr[:, :4].astype(np.float32)
+                    ids = tracks_arr[:, 4].astype(int) + id_offset
+                    confs = tracks_arr[:, 5].astype(np.float32)
+                    clss = tracks_arr[:, 6].astype(int)
+                    max_id = max(max_id, int(ids.max()))
+                else:
+                    boxes, ids, confs, clss = np.zeros((0, 4)), np.zeros(0, int), np.zeros(0), np.zeros(0, int)
+                kpts = None
+            elif r.boxes is not None and r.boxes.id is not None:
                 boxes = r.boxes.xyxy.cpu().numpy()
                 ids = r.boxes.id.int().cpu().numpy() + id_offset
                 confs = r.boxes.conf.cpu().numpy()
@@ -240,6 +304,7 @@ class PlayerJerseyPipeline:
                     prof.add("   ├ pitch keypoints", info["model_ms"])
                 pos = self._project_feet(H, boxes, frame.shape, geo)
                 geo["status"][status] += 1
+                geo["motion"][idx], geo["shot_of"][idx], geo["shape"] = info.get("motion"), shot_id, frame.shape
                 if status == "kp" and "err_m" in info:
                     geo["err_m"].append(info["err_m"])
                 if status == "kp" and "rep_err_px" in info:
@@ -268,6 +333,18 @@ class PlayerJerseyPipeline:
                             tb = torso_from_bbox(b, frame.shape, config.TEAM_BBOX_RATIO)
                             if tb is not None:
                                 teamer.add(int(t), idx, frame[tb[1]:tb[3], tb[0]:tb[2]])
+
+            # --- embedding ngoại hình (--reid) cho bước nối định danh
+            if self.reid is not None:
+                sel = [i for i, (b, cl) in enumerate(zip(boxes, clss))
+                       if b[3] - b[1] >= config.REID_MIN_BOX_HEIGHT and int(cl) in self.read_classes]
+                if sel:
+                    with prof("5c. re-ID embed", n_items=len(sel)):
+                        h, w = frame.shape[:2]
+                        crops = [frame[max(int(boxes[i][1]), 0):min(int(boxes[i][3]), h),
+                                       max(int(boxes[i][0]), 0):min(int(boxes[i][2]), w)] for i in sel]
+                        for i, e in zip(sel, self.reid(crops)):
+                            geo["emb"][(idx, int(ids[i]))] = e
 
             # --- chọn cầu thủ cần đọc số ở frame này
             cand = [i for i, (b, t) in enumerate(zip(boxes, ids))
@@ -325,17 +402,47 @@ class PlayerJerseyPipeline:
                 preds = self.recognizer.predict(torso_crops)
             for tid, crop, (label, prob) in zip(owners, torso_crops, preds):
                 voter.add(tid, label, prob)
+                read_log.append((idx, tid, label, prob))
                 if crops_dir is not None:
                     with prof("   save crops (debug)", n_items=1):
                         cv2.imwrite(str(crops_dir / f"t{tid:04d}_f{idx:06d}_{label or 'x'}_{prob:.2f}.jpg"), crop)
 
         geo["shots"] = shots.shot_id + 1 if shots is not None else 1
+        geo["reads"] = read_log
         return voter, frame_log, span, stats, geo, teamer
 
-    def _project_feet(self, H, boxes, shape, geo):
-        """Điểm chân (đáy-giữa bbox) -> toạ độ sân (m). None nếu không chiếu được / không tin được."""
+    def _fill_gaps(self, frame_log, geo):
+        """Frame chưa có H trong shot -> lan H qua chuyển động camera (PitchCalibrator.fill_gaps), chiếu lại chân
+        cầu thủ ở các frame đó, h_status = 'fill'. Trả frame_log mới."""
+        homs = {f: h[0] for f, h in geo["homs"].items()}
+        filled = self.calib.fill_gaps(homs, geo["motion"], geo["shot_of"], geo["shape"]) if geo["shape"] else {}
+        geo["n_filled"] = len(filled)
+        if not filled:
+            return frame_log
+        for f, H in filled.items():
+            geo["homs"][f] = (H, "fill", geo["homs"][f][2])
+            geo["status"]["none"] -= 1
+            geo["status"]["fill"] += 1
+        by_f = defaultdict(list)
+        for k, r in enumerate(frame_log):
+            if r[0] in filled:
+                by_f[r[0]].append(k)
+        out = list(frame_log)
+        for f, ks in by_f.items():
+            boxes = np.array([frame_log[k][2:6] for k in ks], dtype=np.float32)
+            pos = self._project_feet(filled[f], boxes, geo["shape"], geo, count=False)
+            for k, p in zip(ks, pos):
+                r = frame_log[k]
+                out[k] = (*r[:9], None if p is None else round(float(p[0]), 2),
+                          None if p is None else round(float(p[1]), 2), "fill")
+        return out
+
+    def _project_feet(self, H, boxes, shape, geo, count=True):
+        """Điểm chân (đáy-giữa bbox) -> toạ độ sân (m). None nếu không chiếu được / không tin được.
+        count=False: chiếu lại (fill_gaps) -> không đếm thêm vào tổng số cầu thủ."""
         pos = [None] * len(boxes)
-        geo["players"] += len(boxes)
+        if count:
+            geo["players"] += len(boxes)
         if H is None or not len(boxes):
             return pos
         L, W, m = self.pitch_cfg.length, self.pitch_cfg.width, config.PITCH_OUTSIDE_M
@@ -360,6 +467,7 @@ class PlayerJerseyPipeline:
         for row in frame_log:
             by_frame[row[0]].append(row)
         team_of, palette = team_of or {}, palette or {}
+        det_num, det_src = numbers                    # (frame, track) -> số áo, nguồn ('read' | 'linked' | '')
         mm = MinimapRenderer(self.pitch_cfg, config.MINIMAP_WIDTH, palette=palette) if positions is not None else None
         tmp = dst.with_suffix(".tmp.mp4")
         t0 = time.perf_counter()
@@ -375,24 +483,26 @@ class PlayerJerseyPipeline:
             if a.pitch_debug and geo is not None:
                 draw_debug(frame, self.pitch_cfg, H, status, dbg, a.pitch_kpt_conf)
             for _, tid, x1, y1, x2, y2, *_ in rows:
-                num = numbers.get(tid, -1)
+                num = det_num.get((idx, tid), -1)
+                # * = số có được nhờ nối, chưa tự đọc; ? = chỉ có nhờ nối qua lần gặp đồng đội (có thể nhầm người)
+                mark = {"linked": "*", "uncertain": "?"}.get(det_src.get((idx, tid)), "")
                 team = team_of.get((idx, tid), -1)
                 if team in palette:
                     color = palette[team]
-                    text = f"{'AB'[team]} #{num}" if num > 0 else f"{'AB'[team]} id{tid}"
+                    text = f"{'AB'[team]} #{num}{mark}" if num > 0 else f"{'AB'[team]} id{tid}"
                 elif roles.get(tid) == "goalkeeper":
                     color = (0, 215, 255)
-                    text = f"GK #{num}" if num > 0 else "GK"
+                    text = f"GK #{num}{mark}" if num > 0 else "GK"
                 else:
                     color = (0, 220, 0) if num > 0 else (160, 160, 160)
-                    text = f"#{num}" if num > 0 else ("ref" if roles.get(tid) == "referee" else f"id{tid}")
+                    text = f"#{num}{mark}" if num > 0 else ("ref" if roles.get(tid) == "referee" else f"id{tid}")
                 cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 0, 0), 4)    # viền đen để thấy cả áo trắng/đen
                 cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
                 (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
                 cv2.rectangle(frame, (x1, y1 - th - 6), (x1 + tw + 4, y1), color, -1)
                 cv2.putText(frame, text, (x1 + 2, y1 - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.6, text_ink(color), 2)
             if mm is not None:
-                dots = [(*positions[(idx, row[1])], roles.get(row[1], "player"), numbers.get(row[1], -1),
+                dots = [(*positions[(idx, row[1])], roles.get(row[1], "player"), det_num.get(row[:2], -1),
                          team_of.get(row[:2], -1)) for row in rows if (idx, row[1]) in positions]
                 if H is not None or dots:
                     last_dots, stale_n = dots, 0
@@ -472,34 +582,64 @@ class PlayerJerseyPipeline:
 
         positions, mm_summary = None, None
         if a.minimap:
+            with prof("7a. fill homography gaps", n_items=len(geo["homs"])):
+                frame_log = self._fill_gaps(frame_log, geo)
             with prof("7b. smooth positions", n_items=len(frame_log)):
                 positions = smooth_positions([(r[0], (r[1], r[8]), r[9], r[10]) for r in frame_log])
             mm_summary = minimap_summary(geo)
 
+        # số áo theo từng detection: mặc định = số của cả track; với --link = số của cầu thủ (chuỗi nối)
+        det_num = {(r[0], r[1]): numbers.get(r[1], -1) for r in frame_log}
+        det_src = {k: ("read" if n > 0 else "") for k, n in det_num.items()}
+        det_pid, players, link_stats = {}, None, None
+        if positions is not None and a.link:
+            with prof("7d. link identities", n_items=len(frame_log)):
+                linker = IdentityLinker(fps, config, dict(filter_threshold=config.FILTER_THRESHOLD,
+                                                          sum_threshold=a.sum_th, use_bias=config.USE_BIAS))
+                linker.enc_split = a.enc_split
+                linker.solver = a.link_solver
+                ident, players, link_stats = linker.run([(r[0], r[1]) for r in frame_log], positions, team_of,
+                                                        roles, geo["reads"], emb=geo["emb"] or None)
+            for k, (pid, num, how) in ident.items():
+                det_pid[k], det_num[k], det_src[k] = pid, num, how
+            ids = defaultdict(lambda: defaultdict(int))     # track -> player_id -> số frame
+            for (fr, tid), pid in det_pid.items():
+                ids[tid][pid] += 1
+            for tid, tr in tracks.items():
+                tr["player_ids"] = dict(ids.get(tid, {}))
+
         t_out = time.perf_counter()
         with open(out_dir / "tracks.json", "w") as f:
-            json.dump({"source": str(src), "fps": fps, "shots": geo["shots"], "minimap": mm_summary,
-                       "teams": team_info, "tracks": tracks}, f, indent=2)
+            json.dump({"source": str(src), "fps": fps, "frame_size": list(size), "shots": geo["shots"],
+                       "minimap": mm_summary,
+                       "teams": team_info, "link": link_stats, "players": players, "tracks": tracks}, f, indent=2)
+        with open(out_dir / "reads.csv", "w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(["frame", "track_id", "label", "prob"])
+            w.writerows((fr, t, lb, f"{p:.3f}") for fr, t, lb, p in geo["reads"])
         with open(out_dir / "detections.csv", "w", newline="") as f:
             w = csv.writer(f)
-            w.writerow(["frame", "track_id", "x1", "y1", "x2", "y2", "det_conf", "jersey_number",
-                        "class", "team", "shot_id", "x_m", "y_m", "h_status"])
+            w.writerow(["frame", "track_id", "x1", "y1", "x2", "y2", "det_conf", "jersey_number", "number_source",
+                        "player_id", "class", "team", "shot_id", "x_m", "y_m", "h_status"])
             for row in frame_log:
-                w.writerow([*row[:6], f"{row[6]:.3f}", numbers.get(row[1], -1), self.class_names[row[7]],
-                            team_of.get(row[:2], -1), row[8], "" if row[9] is None else row[9],
-                            "" if row[10] is None else row[10], row[11]])
+                k = row[:2]
+                w.writerow([*row[:6], f"{row[6]:.3f}", det_num[k], det_src[k], det_pid.get(k, ""),
+                            self.class_names[row[7]], team_of.get(k, -1), row[8],
+                            "" if row[9] is None else row[9], "" if row[10] is None else row[10], row[11]])
         if positions is not None:
             # vị trí đã làm mượt, chỉ những frame chiếu được; toạ độ (0,0) = góc sân, x dọc chiều dài
             status = {f: h[1] for f, h in geo["homs"].items()}
             with open(out_dir / "positions.csv", "w", newline="") as f:
                 w = csv.writer(f)
-                w.writerow(["frame", "track_id", "role", "team", "jersey_number", "shot_id", "h_status",
-                            "x_m", "y_m"])
+                w.writerow(["frame", "track_id", "player_id", "role", "team", "jersey_number", "number_source",
+                            "shot_id", "h_status", "x_m", "y_m"])
                 for row in frame_log:
                     p = positions.get((row[0], row[1]))
                     if p is not None:
-                        w.writerow([row[0], row[1], roles.get(row[1], "player"), team_of.get(row[:2], -1),
-                                    numbers.get(row[1], -1), row[8], status.get(row[0], ""), f"{p[0]:.2f}", f"{p[1]:.2f}"])
+                        k = row[:2]
+                        w.writerow([row[0], row[1], det_pid.get(k, ""), roles.get(row[1], "player"),
+                                    team_of.get(k, -1), det_num[k], det_src[k], row[8], status.get(row[0], ""),
+                                    f"{p[0]:.2f}", f"{p[1]:.2f}"])
         prof.add("8. write json/csv", (time.perf_counter() - t_out) * 1000)
 
         n_frames = len(prof.calls.get("2. detect+track", []))
@@ -521,20 +661,40 @@ class PlayerJerseyPipeline:
         for t, n in sorted(identified.items(), key=lambda kv: kv[1]):
             print(f"    track {t:>4}: #{n:<3} (weight {tracks[t]['weight']}, frames {span[t][0]}-{span[t][1]})")
 
+        if link_stats is not None:
+            ls = link_stats
+            n_before = sum(1 for k, n in det_src.items() if n == "read")
+            pl = sorted(((p["team"], p["number"], pid) for pid, p in players.items() if p["number"] > 0))
+            print(f"  định danh (minimap): {ls['segments']} đoạn -> nối {ls['links']} lần "
+                  f"(ghép {ls['solver']}; bỏ {ls['skipped_ambiguous']} cặp mập mờ, {ls['skipped_crowd']} cặp đám đông, "
+                  f"{ls['skipped_number_conflict']} cặp khác số áo)")
+            if a.reid:
+                print(f"    re-ID: {ls['crowd_resolved_by_reid']} cặp đám đông được ngoại hình phân định -> "
+                      f"nối {ls['links_reid']} lần (số áo qua đó = 'uncertain')")
+            if a.enc_split:
+                print(f"    gặp đồng đội: {ls['encounters']} lần -> nối qua lần gặp {ls['encounter_links']}, "
+                      f"đoạn E gắn lại {ls['encounter_segments_attached']}/{ls['encounter_segments']}")
+            print(f"    detection có số áo: tự đọc {100 * ls['dets_read'] / max(ls['dets_total'], 1):.1f}% + "
+                  f"nhờ nối {100 * ls['dets_linked'] / max(ls['dets_total'], 1):.1f}% + "
+                  f"không chắc {100 * ls['dets_uncertain'] / max(ls['dets_total'], 1):.1f}% | "
+                  f"{ls['players_with_number']} cầu thủ có số: {', '.join(pid for _, _, pid in pl)}")
+            print(f"    cảnh báo trùng (cùng player_id 2 lần trong 1 frame): {ls['dup_frame_ids']} lần")
         if mm_summary is not None:
             s = mm_summary
             print(f"  minimap: {geo['shots']} shot | frame có phép chiếu: kp {s['pct_kp']}%, flow {s['pct_flow']}%, "
-                  f"không có {s['pct_none']}% | lỗi reprojection trung vị "
+                  f"lan ngược {s['pct_fill']}%, không có {s['pct_none']}% | lỗi reprojection trung vị "
                   + (f"{s['median_err_px']} px" if s['median_err_px'] is not None else f"{s['median_err_m']} m"))
             print(f"           cầu thủ chiếu lên sân được: {s['pct_projected']}% "
                   f"(ngoài sân -> bỏ {s['pct_outside']}%, chân bị cắt ở mép frame {s['pct_cut_off']}%)")
         elif geo["shots"] > 1:
             print(f"  shots: {geo['shots']} (tracker reset ở mỗi cắt cảnh)")
+        if a.tile:
+            print(f"  tile: thêm {geo['tile_extra']} box cầu thủ nhỏ mà full frame không thấy (trước tracker)")
 
         if not a.no_video:
             palette = ({k: tuple(d["color_bgr"]) for k, d in enumerate(team_info["teams"])}
                        if team_info and team_info["ok"] else {})
-            paths = self.render(src, out_dir / f"{src.stem}_jersey.mp4", frame_log, numbers, roles, fps, size,
+            paths = self.render(src, out_dir / f"{src.stem}_jersey.mp4", frame_log, (det_num, det_src), roles, fps, size,
                                 prof, positions, geo if a.minimap else None, team_of, palette)
             for path in paths:
                 print(f"  video: {path}")
@@ -548,7 +708,9 @@ class PlayerJerseyPipeline:
                             "pose_model": None if (self.det_is_pose or a.torso_mode == "bbox") else a.pose_model,
                             "imgsz": a.imgsz, "stride": a.stride, "no_legibility": a.no_legibility,
                             "minimap": a.minimap, "pitch_every": a.pitch_every if a.minimap else None,
-                            "reset_on_cut": a.reset_on_cut, "teams": a.teams}
+                            "reset_on_cut": a.reset_on_cut, "teams": a.teams, "tracker": Path(a.tracker).name,
+                            "conf": a.conf, "tile": a.tile, "enc_split": a.enc_split,
+                            "link_solver": a.link_solver, "reid": a.reid}
         StepTimer.print_table(timing)
         print(f"  analyse (pass 1, không tính render): {timing['analyse_fps']} fps")
         with open(out_dir / "timing.json", "w") as f:
@@ -562,7 +724,7 @@ def minimap_summary(geo) -> dict:
     pct = lambda v, d: round(100 * v / d, 1)  # noqa: E731
     return {"shots": geo["shots"],
             "pct_kp": pct(geo["status"]["kp"], n), "pct_flow": pct(geo["status"]["flow"], n),
-            "pct_none": pct(geo["status"]["none"], n),
+            "pct_fill": pct(geo["status"]["fill"], n), "pct_none": pct(geo["status"]["none"], n),
             "median_err_m": round(float(np.median(geo["err_m"])), 3) if geo["err_m"] else None,
             "median_err_px": round(float(np.median(geo["err_px"])), 2) if geo["err_px"] else None,
             "pct_projected": pct(geo["projected"], p), "pct_outside": pct(geo["outside"], p),

@@ -7,6 +7,9 @@ Mỗi frame:
   4. Camera chuyển động giữa 2 frame (optical flow) -> dự đoán H từ frame trước. Dùng để
      (a) lấp frame thiếu điểm mốc trong cùng shot, (b) làm mượt H mà không bị trễ khi camera pan.
   Cắt cảnh -> reset() (góc máy mới, H cũ vô nghĩa).
+  5. Sau cả video, fill_gaps(): frame vẫn chưa có H (đầu shot trước lần đo đầu tiên, hoặc H mất giữa shot
+     tới lần đo tốt tiếp theo) -> lan NGƯỢC từ frame có H phía sau qua chuyển động camera đã lưu (bước 4 chỉ
+     lan xuôi được).
 
 Hệ toạ độ sân: gốc (0, 0) = góc sân trái-trên của minimap, x dọc chiều dài (0..L), y dọc chiều rộng
 (0..W), đơn vị mét.
@@ -267,10 +270,12 @@ class PitchCalibrator:
         info = {}
 
         pred = None                                        # H của frame trước, dời theo chuyển động camera
-        if self.H is not None and self.prev_gray is not None:
+        M = None                                           # luôn tính (kể cả khi chưa có H) -> fill_gaps lan ngược
+        if self.prev_gray is not None:
             M = self._camera_motion(self.prev_gray, gray, boxes, s)
-            if M is not None:
+            if M is not None and self.H is not None:
                 pred = self._normalise(self.H @ np.linalg.inv(M), frame.shape)
+        info["motion"] = M
         ref = pred if pred is not None else self.H
 
         meas, switch = None, False
@@ -309,3 +314,41 @@ class PitchCalibrator:
         self.H = H
         self.prev_gray = gray
         return H, status, info
+
+    def fill_gaps(self, homs, motion, shot_of, shape):
+        """Lấp frame chưa có H sau khi xử lý xong video.
+
+        homs: frame -> H | None; motion: frame -> M (ảnh frame-1 -> ảnh frame) | None; shot_of: frame -> shot.
+        Mỗi đoạn frame liên tiếp không có H trong cùng shot: lan H từ frame có H ngay trước (xuôi: H·M⁻¹) và ngay
+        sau (ngược: H·M), tối đa max_flow_frames bước, dừng khi 1 bước không có chuyển động camera hoặc H không hợp
+        lý; frame lấp được từ cả 2 phía lấy phía gần hơn. Trả {frame: H}."""
+        out = {}
+        frames = sorted(homs)
+        i = 0
+        while i < len(frames):
+            f = frames[i]
+            if homs[f] is not None:
+                i += 1
+                continue
+            j = i
+            while (j + 1 < len(frames) and homs[frames[j + 1]] is None and frames[j + 1] == frames[j] + 1
+                   and shot_of.get(frames[j + 1]) == shot_of.get(f)):
+                j += 1
+            run, best = frames[i:j + 1], {}
+            for direction in (1, -1):
+                anchor = run[0] - 1 if direction == 1 else run[-1] + 1
+                H = homs.get(anchor)
+                if H is None or shot_of.get(anchor) != shot_of.get(f):
+                    continue
+                for k, g in enumerate(run if direction == 1 else run[::-1]):
+                    M = motion.get(g if direction == 1 else g + 1)
+                    if M is None or k >= self.max_flow_frames:
+                        break
+                    H = self._normalise(H @ np.linalg.inv(M) if direction == 1 else H @ M, shape)
+                    if H is None or not self.plausible(H, shape):
+                        break
+                    if g not in best or best[g][0] > k:
+                        best[g] = (k, H)
+            out.update({g: H for g, (_, H) in best.items()})
+            i = j + 1
+        return out

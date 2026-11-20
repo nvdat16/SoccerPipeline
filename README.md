@@ -155,7 +155,9 @@ Nhận xét:
 | `--imgsz` | 1280 | kích thước input YOLO (cầu thủ nhỏ thì để lớn) |
 | `--det-model` | `yolo26s-soccer.pt` | model detect (Ultralytics). Không có file này thì dùng `yolo11m-pose.pt` (COCO) |
 | `--classes` | tự chọn | class cầu thủ, theo id hoặc tên (`player goalkeeper`). Không truyền thì tự lấy các class tên `person` / `player` / `goalkeeper` / `goalie` |
-| `--tracker` | `bytetrack.yaml` | hoặc `botsort.yaml` |
+| `--tracker` | `trackers/bytetrack_soccer.yaml` | ByteTrack với ngưỡng cho bóng đá. `trackers/botsort_soccer.yaml` = thêm bù chuyển động camera; `bytetrack.yaml` = mặc định ultralytics (xem [Cầu thủ ở xa](#cầu-thủ-ở-xa)) |
+| `--conf` | 0.1 | ngưỡng **detector**. Để thấp: box 0.1–0.3 không tạo track mới, chỉ giữ track cũ (bước ghép thứ 2 của BYTE). Ngưỡng tạo track nằm trong file yaml |
+| `--tile` / `--no-tile` | off | detect thêm trên lưới tile vùng xa camera để bắt cầu thủ nhỏ (`TILE_*` trong `config.py`, xem [Cầu thủ ở xa](#cầu-thủ-ở-xa)) |
 | `--min-box-height` | 60 | bỏ cầu thủ nhỏ hơn N px |
 | `--legibility-th` | 0.5 | ngưỡng "thấy được số áo" |
 | `--sum-th` | 1.0 | tổng trọng số tối thiểu để chốt số áo cho track |
@@ -164,6 +166,10 @@ Nhận xét:
 | `--no-legibility` | off | bỏ legibility, đọc số mọi cầu thủ (debug) |
 | `--save-crops` | off | lưu crop thân áo kèm số đọc được |
 | `--teams` / `--no-teams` | on | chia 2 đội theo màu áo (xem [Chia đội](#chia-đội)) |
+| `--link` / `--no-link` | on | (cần `--minimap`) nối track thành cầu thủ, truyền số áo (xem [Định danh cầu thủ](#định-danh-cầu-thủ-trên-minimap)) |
+| `--enc-split` / `--no-enc-split` | off | (cần `--link`) xử lý riêng lúc 2 đồng đội gặp nhau (xem [Cầu thủ ở xa](#cầu-thủ-ở-xa)) |
+| `--link-solver` | `global` | (cần `--link`) `global`: ghép Hungarian tối ưu toàn cục; `greedy`: tham lam (bản cũ) |
+| `--reid` / `--no-reid` | off | (cần `--link`) ngoại hình OSNet phân định cặp nối trong đám đông (xem [Cầu thủ ở xa](#cầu-thủ-ở-xa)) |
 
 Với `--torso-mode pose`: nếu `--det-model` không phải model pose (ví dụ `yolo26s-soccer.pt`), pipeline chạy thêm
 `--pose-model` (mặc định `yolo26n-pose.pt`) để lấy keypoints rồi ghép với bbox theo IoU.
@@ -206,6 +212,7 @@ frame ─► phát hiện cắt cảnh (histogram HSV) ── cut? ─► reset 
       ─► calibration (mặc định PnLCalib, mỗi 5 frame): điểm mốc + vạch sân CÓ TÊN ─► homography ảnh → sân
       ─► kiểm tra: lỗi reprojection, vùng sân nhìn thấy hợp lý, không nhảy so với dự đoán
       ─► frame xen giữa / thiếu điểm mốc ─► nối H bằng optical flow (chuyển động camera, tối đa ~2 s)
+      ─► hết video: frame vẫn thiếu H trong shot ─► lan NGƯỢC từ lần đo tốt kế tiếp qua chuyển động camera
       ─► chân cầu thủ (đáy-giữa bbox) × H ─► (x, y) mét ─► làm mượt theo track ─► minimap + positions.csv
 ```
 
@@ -250,21 +257,120 @@ minimap là đường biên phía camera chính (cả 2 backend cùng quy ước
 Giới hạn:
 - Chưa vẽ bóng lên minimap (detector có class `ball` nhưng pipeline chưa dùng).
 - Cảnh chỉ thấy vạch biên + cỏ (giữa sân, camera zoom) có ít điểm mốc -> sau ~2 s optical flow thì mất phép chiếu.
+  Sau cả video, đoạn thiếu H trong shot được lan ngược từ lần đo tốt kế tiếp (`h_status = fill`). Trên `clip_3400`:
+  +2.0% frame, cầu thủ chiếu lên sân được 91.2% -> 94.1% (ví dụ frame 777–798: 1 lần đo lệch làm mất H 22 frame
+  giữa cảnh rộng). Ở chỗ chuỗi lan xuôi gặp chuỗi lan ngược, chấm có thể nhảy vài mét nếu 2 lần đo lệch nhau
+  (frame 777: 4.7 m); bước nhảy này trước đây vẫn có, chỉ bị che bởi khoảng trống.
 - Homography coi sân là mặt phẳng và bỏ qua méo ống kính: ở mép khung hình góc rộng có thể lệch 1–2 m.
 - Trong 1 shot, H mới lệch > 5 m so với dự đoán (thường do model nhầm khung thành trái/phải) bị loại và optical flow
   nối qua; chỉ chuyển khi các lần đo trong `PITCH_SWITCH_AFTER` (12) frame liên tiếp cùng chỉ về vị trí mới.
   Nếu ngay đầu shot model đã sai thì phải chờ tới khi nó tự đúng lại.
 - Góc máy lạ (tactical cam, sau khung thành) có thể không nhận ra.
 
+## Định danh cầu thủ trên minimap
+
+Track id của ByteTrack sống rất ngắn: trên `clip_3400`, một nửa số track kéo dài chưa tới 1 s, vì bị che khuất, cắt
+cảnh hoặc đổi ID. Số áo đọc được ở một track vì vậy bị mất khi cầu thủ sang track mới. `--link` (mặc định bật cùng
+`--minimap`, code trong `pipeline/identity.py`, tham số `LINK_*` trong `config.py`) giải quyết bằng cách:
+
+1. **Ghi nhớ khi nhìn rõ**: đoạn track nào đọc được số áo (bỏ phiếu như bình thường) thì gắn số đó.
+   Track bị cắt thành nhiều đoạn ở chỗ đội đổi giữa chừng (ByteTrack đổi ID giữa 2 cầu thủ khác đội).
+2. **Nối lại khi mất dấu**, dựa trên vị trí (mét) trên minimap. Đoạn A kết thúc, đoạn B cùng đội bắt đầu trong
+   vòng 3 s:
+   - vị trí dự đoán = cuối A + **vận tốc** A × khoảng trống (ngoại suy tối đa 1 s);
+   - cho phép lệch 2 m + 3 m mỗi giây mất dấu (tối đa 10 m);
+   - chi phí cộng thêm nếu **hướng chạy** của A và B lệch nhau, hoặc vận tốc đổi đột ngột;
+   - **không nối** nếu: có cầu thủ cùng đội khác cũng đứng gần vị trí dự đoán (đám đông), chi phí quá cao
+     (`LINK_ACCEPT`), cặp mập mờ, hoặc hai bên đã đọc được số khác nhau;
+   - **ghép toàn cục** (`--link-solver global`, mặc định): chọn tập cặp nối có tổng chi phí tốt nhất (Hungarian
+     trên từng cụm ứng viên) thay vì lấy cặp rẻ nhất trước. Cặp mập mờ = bỏ nó đi thì phương án tốt nhất còn lại
+     chỉ kém hơn < `LINK_AMBIGUITY`; khác bản tham lam ở chỗ có tính tới việc ứng viên thứ hai đã thuộc về đoạn khác.
+3. **Định danh = (đội, số áo)**, ví dụ `A26`, `B10`. Số áo đọc ở một đoạn được truyền sang mọi đoạn trong chuỗi.
+   Một cầu thủ không thể ở hai nơi cùng lúc: nếu hai chuỗi cùng `A27` xuất hiện trong cùng frame, chuỗi ít phiếu
+   hơn bị bỏ số (thường do PARSeq đọc nhầm).
+
+Video: `A #26` là số tự đọc được ở đoạn đó, `A #26*` là số có được nhờ nối, `A #26?` là số chỉ có nhờ nối qua một
+lần gặp đồng đội không phân định được (có thể nhầm người). Minimap ghi số trong chấm cho cả ba.
+
+Ràng buộc cứng khi nối: hai chuỗi từng có mặt trong **cùng một frame** là hai người khác nhau, không bao giờ nối.
+
+Trên `clip_3400` (1500 frame, 18 shot), tracker cũ: 284 đoạn, 52 lần nối, 155 cặp bị bỏ vì đám đông. 19 cầu thủ
+có số. Không có `player_id` nào xuất hiện hai lần trong cùng một frame. Detection có số áo: 38.6% tự đọc + 5.1% nhờ
+nối. Với tracker mặc định mới (`bytetrack_soccer.yaml`): 246 đoạn, 45 lần nối, 110 cặp bỏ vì đám đông, 40.6% + 5.3%.
+Trước đây con số là 44% theo cả track, nhưng gồm cả các đoạn bị gán sai số sau khi ByteTrack đổi ID.
+Ghép toàn cục + lấp phép chiếu: 246 đoạn, 47 lần nối, 96 cặp bỏ vì đám đông, 40.6% + 5.2%.
+
+Chất lượng nối đo bằng `tools/link_bench.py`: cắt nhân tạo các track dài (518 chỗ đứt có đáp án, 5 seed), ẩn số
+áo, đếm số chỗ được nối lại đúng / nối sai:
+
+| Cấu hình | Nối lại đúng | Nối sai | Độ chính xác | Dữ liệu thật: số áo nhờ nối |
+|---|---|---|---|---|
+| tham lam, ambiguity 0.15, crowd 1.0 (cũ) | 56% | 48 | 85.8% | 5.3% |
+| **toàn cục, accept 1.2, ambiguity 0.3, crowd 0.5** (mặc định) | 72% | 37 | 91.0% | 5.2% |
+| toàn cục, accept 1.0, ambiguity 0.3, crowd 0.5 | 70% | 26 | 93.3% | 4.1% |
+
+Chỗ đứt thật hay xảy ra lúc bị che khuất nên khó hơn chỗ cắt nhân tạo: bảng này dùng để so sánh các cấu hình.
+
+Giới hạn:
+- Chỉ nối được khi có phép chiếu. Cảnh close-up, replay và khán đài (khoảng 40% frame của clip) làm đứt chuỗi.
+- Ở đám đông (phạt góc, tranh chấp trong vòng cấm), cách nối này chủ động không nối. Re-ID ngoại hình chung
+  (OSNet, `--reid`) đã thử và không đủ (xem [Cầu thủ ở xa](#cầu-thủ-ở-xa)); cần model re-ID train riêng cho bóng đá.
+- Số áo sai từ PARSeq (ví dụ 18 → 28, 11 → 10) vẫn lan ra cả chuỗi. Bước "không ở hai nơi cùng lúc" chỉ bắt được
+  khi hai người cùng số xuất hiện cùng lúc.
+
+## Cầu thủ ở xa
+
+Nguyên tắc: **đọc số khi gần, giữ danh tính bằng chuyển động khi xa, lan số áo cả tiến lẫn lùi** (offline,
+union-find trong `identity.py`). Đo bằng `tools/far_report.py`, thử tham số định danh bằng `tools/relink.py`:
+
+```bash
+python tools/far_report.py outputs/minimap/match                          # A-E: chỉ đọc CSV
+python tools/far_report.py outputs/minimap/match --video match.mp4        # + F: recall cầu thủ nhỏ (full vs tile)
+python tools/relink.py outputs/minimap/match --set LINK_AMBIGUITY=0.2     # chạy lại định danh, không cần GPU
+```
+
+`far_report` in theo nhóm chiều cao box: số lần track đứt giữa shot / 1000 detection, độ phủ số áo
+(`read` / `linked` / `uncertain`), số lần 2 đồng đội gặp nhau (< 1.5 m) và bao nhiêu lần có track đứt ngay sau đó,
+track đọc ra 2 số áo ở 2 quãng tách biệt (dấu hiệu hoán ID), và recall cầu thủ nhỏ.
+
+Kết quả trên `clip_3400` (1500 frame, 720p), từ đó chọn mặc định:
+
+| Thay đổi | Kết quả | Mặc định |
+|---|---|---|
+| Detector `conf` 0.3 → 0.1, tracker `bytetrack_soccer.yaml` | Với conf 0.3 bước ghép thứ 2 của BYTE (box 0.1–0.3 giữ track cũ) không bao giờ nhận được box nào. Sửa: đứt track giữa shot 10.5 → 7.5 / 1000 detection (−29%), "gặp nhau rồi đứt" 58% → 39%, số áo phủ 43.9% → 45.8% | **bật** |
+| BoT-SORT + bù chuyển động camera (`botsort_soccer.yaml`) | Đứt track như trên (7.5), số áo phủ 38.1%, tracker chậm ~3 lần | tắt |
+| Cannot-link: 2 chuỗi có mặt trong cùng 1 frame không được nối | Chặn được lần nối sai (2 cầu thủ áo trắng đứng cạnh nhau); trên dữ liệu không có `--enc-split` thì chưa gặp ca nào | **luôn bật** |
+| `--enc-split`: cắt track lúc 2 đồng đội gặp nhau, phân định lại bằng chuyển động | Xem lại trên video: 2/2 lần "chuyển động nói đã hoán ID" đều sai (2 người chồng nhau chỉ cách ~0.5 m trên sân, trong nhiễu phép chiếu) -> chuyển sang tin tracker; khi đó không thêm được lần nối đúng nào, độ phủ −1.8 điểm | tắt |
+| `--tile`: detect thêm trên tile vùng xa | 80 frame rải khắp `video1.mp4`: full frame (imgsz 1280) thấy 97 cầu thủ < 45 px, tile thêm 0 | tắt |
+| Ghép toàn cục (Hungarian) thay tham lam | Benchmark cắt track: nối lại đúng 56% -> 72%, nối sai 48 -> 37; dữ liệu thật giữ 5.2% số áo nhờ nối | **bật** |
+| Lan ngược phép chiếu (`fill`) | +2.0% frame có H, cầu thủ chiếu lên sân 91.2% -> 94.1% | **luôn bật** |
+| `--reid`: OSNet-AIN (MSMT17) phân định cặp bị luật đám đông chặn | Mô phỏng đứt track: trong đám đông ngoại hình chọn đúng 62% (vị trí: 39%), chỉ quyết khi chênh rõ thì ~79% nhưng chỉ quyết được 12–21% ca; LDA học theo video không giúp. Benchmark: +5 nối đúng / +3 nối sai; chạy thật: nối thêm 1 lần; chậm thêm ~8% thời gian (5 ms/crop trên M1). Đồng đội mặc áo giống hệt, 720p không đủ chi tiết | tắt |
+
+Chưa làm: tracker trong hệ toạ độ sân (Kalman theo mét). Sau các thay đổi trên, 65 lần track đứt giữa shot chưa
+nối được, linker bỏ 110 cặp vì có đồng đội đứng gần: đúng những ca vị trí + vận tốc không phân biệt được, nên một
+tracker cũng chỉ dùng vị trí + vận tốc sẽ không giải quyết được. Cần thêm tín hiệu khác (số áo đọc được nhiều hơn,
+hoặc re-ID ngoại hình cho khoảng trống ngắn — OSNet chung đã thử, không đủ; cần model train trên cầu thủ, ví dụ
+SoccerNet Re-ID).
+
+Video độ phân giải cao hơn (1080p, camera rộng hơn) có thể cho kết quả khác: chạy `far_report --video` trước khi
+quyết định bật `--tile`.
+
 ## Output (`outputs/<tên video>/`)
-- `<tên>_jersey.mp4`: bbox màu đội kèm `A #số` / `B idN`. Track chưa rõ đội: xanh nếu có số, xám nếu chưa.
+- `<tên>_jersey.mp4`: bbox màu đội kèm `A #số` / `B idN` (`*` sau số = số có nhờ nối, `?` = không chắc). Track chưa rõ đội: xanh nếu
+  có số, xám nếu chưa.
   Thủ môn: `GK` màu vàng. Thêm minimap nếu bật `--minimap`.
 - `tracks.json`: mỗi track gồm `role`, `team` (đội chiếm đa số, 0 = A | 1 = B | -1), `team_conf`, `team_switches`,
   `jersey_number` (-1 nếu không đọc được), `votes`, `attempts`, `legible`, `str_reads`. Thêm `shots`, `teams`
-  (màu BGR và màu chủ đạo của mỗi đội), và thống kê `minimap` nếu bật `--minimap`.
-- `detections.csv`: `frame, track_id, x1, y1, x2, y2, det_conf, jersey_number, class, team, shot_id, x_m, y_m,
-  h_status`. `team` tính theo frame. `x_m, y_m` là giá trị thô, chưa làm mượt. `h_status` = `kp` | `flow` | `none`.
-- `positions.csv` (`--minimap`): `frame, track_id, role, team, jersey_number, shot_id, h_status, x_m, y_m`, đã làm mượt
+  (màu BGR và màu chủ đạo của mỗi đội), và thống kê `minimap` nếu bật `--minimap`. Với `--link`: mỗi track có thêm
+  `player_ids`; thêm `players` (mỗi cầu thủ: đội, số, các track, số frame) và thống kê `link`.
+- `reads.csv`: mọi lần PARSeq đọc số: `frame, track_id, label, prob`.
+- `detections.csv`: `frame, track_id, x1, y1, x2, y2, det_conf, jersey_number, number_source, player_id, class, team,
+  shot_id, x_m, y_m, h_status`. `team`, `jersey_number` và `player_id` tính theo frame. `number_source` = `read`
+  (đoạn này có đọc ra số đó) | `linked` (nhờ nối) | `uncertain` (chỉ nhờ nối qua lần gặp đồng đội không phân định
+  được, hoặc nhờ `--reid`) | rỗng. `x_m, y_m` là giá trị thô, chưa làm mượt. `h_status` = `kp` | `flow` | `fill`
+  (lan ngược sau cả video) | `none`.
+- `positions.csv` (`--minimap`): `frame, track_id, player_id, role, team, jersey_number, number_source, shot_id,
+  h_status, x_m, y_m`, đã làm mượt
 - `timing.json`: thời gian suy luận từng bước (decode, detect+track, legibility, pose, crop, PARSeq, vote, render)
 
 ## Cấu trúc
@@ -272,6 +378,10 @@ Giới hạn:
 run.py                  # entry point: analyse (pass 1) + render (pass 2)
 scripts/                # setup.sh, run_*.sh cho từng luồng, compare.sh, diagnose.sh
 tools/diagnose.py       # chẩn đoán từng bước trên mọi cầu thủ
+tools/far_report.py     # đo tracking/định danh theo kích thước box, lần gặp đồng đội, recall box nhỏ (tile)
+tools/relink.py         # chạy lại bước định danh từ CSV (không GPU) để thử tham số
+tools/link_bench.py     # benchmark bước nối có đáp án: cắt nhân tạo track dài, đếm nối lại đúng / sai
+trackers/               # cấu hình tracker (bytetrack_soccer.yaml mặc định, botsort_soccer.yaml thêm GMC)
 yolo26s-soccer.pt       # detector bóng đá (0 ball, 1 goalkeeper, 2 player, 3 referee), xem "Detector & dataset"
 config.py               # đường dẫn weights, ngưỡng mặc định
 download_models.py      # tải weights legibility + PARSeq từ Google Drive
@@ -283,9 +393,12 @@ pipeline/
   profiler.py           # đo thời gian từng bước -> timing.json
   aggregator.py         # bỏ phiếu số áo theo track
   shots.py              # phát hiện cắt cảnh
-  pitch.py              # 32 điểm mốc sân -> homography ảnh->sân, kiểm tra, optical flow
+  pitch.py              # 32 điểm mốc sân -> homography ảnh->sân, kiểm tra, optical flow, lan ngược lấp khoảng trống
   minimap.py            # vẽ minimap, làm mượt vị trí, overlay debug
   team.py               # chia đội: histogram màu áo + KMeans, nhãn đội theo frame
+  identity.py           # nối track thành cầu thủ theo vị trí/vận tốc/hướng trên minimap (Hungarian), truyền số áo
+  reid.py               # OSNet-AIN (rút gọn từ torchreid, MIT) -> embedding ngoại hình cho --reid
+  tiling.py             # detect trên tile (cầu thủ nhỏ) + gọi tracker trực tiếp với detection đã gộp
   calib_pnl.py          # backend PnLCalib (HRNet điểm + vạch) -> homography
   device.py
 third_party/parseq/     # code strhub (PARSeq, Apache-2.0), vendor từ jersey-number-pipeline
@@ -295,7 +408,8 @@ third_party/pnlcalib/   # PnLCalib, chỉ phần inference (GPL-2.0-or-later)
 ## Giới hạn
 - YOLO COCO detect mọi "person": trọng tài, thủ môn, khán giả sát biên cũng được track. Muốn chỉ lấy cầu thủ
   thì dùng detector train trên dữ liệu bóng đá (vd `--det-model yolo26s-soccer.pt`); class cầu thủ được tự chọn theo tên.
-- Không có bước lọc outlier bằng re-ID như paper gốc. Nếu ByteTrack đổi ID giữa 2 cầu thủ thì phiếu bầu của track bị lẫn.
+- Không có bước lọc outlier bằng re-ID như paper gốc. ByteTrack đổi ID giữa 2 cầu thủ **khác đội** thì được tách ra
+  (chia đội + `--link`). Đổi ID giữa 2 cầu thủ **cùng đội** thì phiếu bầu số áo vẫn bị lẫn.
 - Số áo cần đủ lớn: góc quay broadcast xa thường chỉ đọc được khi camera zoom gần.
 - `yolo26s-soccer` gần như **không detect được cầu thủ ở cảnh cận** (box > ~300px) — đúng lúc số áo rõ nhất.
   Dùng `run_coco.sh` cho cảnh cận, hoặc fine-tune thêm ảnh cận.
@@ -305,3 +419,5 @@ third_party/pnlcalib/   # PnLCalib, chỉ phần inference (GPL-2.0-or-later)
 Weights và phương pháp nhận dạng số áo: CC BY-NC 3.0 (của repo gốc), **chỉ dùng phi thương mại**.
 PARSeq: Apache-2.0. Ultralytics YOLO: AGPL-3.0. PnLCalib (`third_party/pnlcalib`): code GPL-2.0-or-later, weights
 CC BY 4.0. Pitch keypoint model Roboflow `sports`: kiểm tra license của repo đó trước khi dùng ngoài mục đích nghiên cứu.
+OSNet (`pipeline/reid.py`, chỉ dùng với `--reid`): kiến trúc từ deep-person-reid/torchreid (MIT); weights train trên
+MSMT17, bộ dữ liệu chỉ cho phép nghiên cứu.

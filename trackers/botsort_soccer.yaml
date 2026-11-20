@@ -1,0 +1,20 @@
+# BoT-SORT = bytetrack_soccer.yaml + bù chuyển động camera (GMC). Trên clip_3400 không giảm đứt track so với
+# bytetrack_soccer.yaml mà tracker chậm ~3 lần -> không mặc định; thử khi video pan rất nhanh.
+# Detector chạy ở conf thấp (config.DET_CONF = 0.1): box 0.1-0.3 KHÔNG tạo track mới, chỉ dùng ở bước ghép
+# thứ 2 của BYTE để giữ track cũ khi detector thấy mờ (cầu thủ xa, bị che một phần).
+tracker_type: botsort
+track_high_thresh: 0.3    # bước ghép 1: box chắc chắn
+track_low_thresh: 0.1     # bước ghép 2: box 0.1-0.3 chỉ nối vào track đang có
+new_track_thresh: 0.4     # track mới cần box >= 0.4 (ít track rác từ box yếu)
+track_buffer: 50          # giữ track mất dấu ~2 s ở 25 fps (bị che khi 2 cầu thủ cắt nhau)
+match_thresh: 0.8
+fuse_score: True
+
+# Bù chuyển động camera: không có GMC thì khi camera pan, Kalman dự đoán sai chỗ -> box nhỏ không còn chồng
+# lên dự đoán (IoU = 0) -> mất track. sparseOptFlow nhanh (~vài ms ở downscale 2).
+gmc_method: sparseOptFlow
+
+proximity_thresh: 0.5
+appearance_thresh: 0.8
+with_reid: False          # appearance gần như không phân biệt được đồng đội cùng màu áo -> tắt
+model: auto

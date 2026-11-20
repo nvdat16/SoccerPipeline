@@ -39,7 +39,7 @@ def main():
     ap.add_argument("--pose-model", default=config.POSE_MODEL)
     ap.add_argument("--classes", nargs="+", default=None)
     ap.add_argument("--imgsz", type=int, default=config.DET_IMGSZ)
-    ap.add_argument("--conf", type=float, default=config.DET_CONF)
+    ap.add_argument("--conf", type=float, default=0.3, help="không có tracker -> cần ngưỡng cao hơn config.DET_CONF")
     ap.add_argument("--every", type=int, default=5, help="lấy mẫu mỗi N frame")
     ap.add_argument("--start", type=int, default=0)
     ap.add_argument("--max-frames", type=int, default=0)
