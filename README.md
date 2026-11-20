@@ -1,7 +1,9 @@
 # Player Detection + Jersey Number Recognition
 
-Phát hiện và theo dõi cầu thủ trong video bóng đá, sau đó nhận dạng số áo cho từng cầu thủ.
-**Chỉ chạy inference, không cần train.** Weights nhận dạng số áo lấy từ paper
+Phát hiện và theo dõi cầu thủ trong video bóng đá, sau đó nhận dạng số áo, chia đội và đặt cầu thủ lên minimap 2D.
+Pipeline **chỉ chạy inference**. Detector `yolo26s-soccer` được train riêng trên `dataset.zip` của
+[DatNguyen05/soccer_dataset](https://huggingface.co/datasets/DatNguyen05/soccer_dataset) (xem [Detector & dataset](#detector--dataset)).
+Weights nhận dạng số áo lấy từ paper
 [A General Framework for Jersey Number Recognition in Sports Video](https://openaccess.thecvf.com/content/CVPR2024W/CVsports/papers/Koshkina_A_General_Framework_for_Jersey_Number_Recognition_in_Sports_Video_CVPRW_2024_paper.pdf)
 (Koshkina & Elder, CVPRW 2024), fine-tune trên SoccerNet.
 
@@ -63,6 +65,85 @@ So sánh trên `liver-mu.mp4` (2500 frame, M1 Pro):
 
 > Nếu Google Drive báo hết lượt tải weights: tải 2 file trong `config.MODEL_URLS` về máy, upload
 > thành 1 Kaggle Dataset, rồi chạy với `MODELS_DIR=/kaggle/input/<dataset> python run.py ...`
+
+## Detector & dataset
+
+Detector bóng đá có 4 class: `player`, `goalkeeper`, `referee`, `ball`. Dataset nằm trên Hugging Face:
+[DatNguyen05/soccer_dataset](https://huggingface.co/datasets/DatNguyen05/soccer_dataset).
+
+| File | Nguồn |
+|---|---|
+| `dataset_cu.zip` | trích từ [SoccerNet Tracking](https://github.com/SoccerNet/sn-tracking) |
+| `dataset.zip` | thu thập từ [Roboflow Universe](https://universe.roboflow.com) |
+
+```bash
+pip install -U huggingface_hub
+huggingface-cli download DatNguyen05/soccer_dataset --repo-type dataset --local-dir data/soccer_dataset
+```
+
+Cả 4 cấu hình bên dưới được đánh giá trên **cùng một tập đánh giá**, nên so sánh được giữa hai bộ.
+
+Mỗi bộ có 2 cấu hình train:
+- `yolo26s`: train thẳng yolo26s trên dataset.
+- `yolo26l (...) ⇒ yolo26s`: **knowledge distillation**. Trước tiên train một teacher `yolo26l` trên bộ chỉ gồm các class
+  ghi trong ngoặc (`gk + ball` là goalkeeper và ball, `ball` là chỉ ball). Sau đó distill teacher này sang student `yolo26s`.
+
+**`yolo26s-soccer.pt` trong repo** là cấu hình `yolo26s + new dataset`, tức yolo26s train trên `dataset.zip`, không
+distillation. Đây là cấu hình có mAP50:95 (`all`) cao nhất: 0.514.
+
+### Kết quả trên `dataset_cu.zip` (SoccerNet Tracking)
+
+`yolo26s`:
+
+| Class | Precision | Recall | F1 | mAP50 | mAP50:95 |
+|---|---|---|---|---|---|
+| all | 0.807 | 0.797 | 0.802 | 0.790 | 0.465 |
+| player | 0.968 | 0.956 | 0.962 | 0.974 | 0.630 |
+| goalkeeper | 0.848 | 0.844 | 0.846 | 0.871 | 0.519 |
+| referee | 0.794 | 0.956 | 0.867 | 0.906 | 0.566 |
+| ball | 0.619 | 0.443 | 0.516 | 0.407 | 0.145 |
+
+`yolo26l (gk + ball) ⇒ yolo26s`:
+
+| Class | Precision | Recall | F1 | mAP50 | mAP50:95 |
+|---|---|---|---|---|---|
+| all | 0.839 | 0.812 | 0.825 | 0.803 | 0.446 |
+| player | 0.952 | 0.937 | 0.944 | 0.960 | 0.579 |
+| goalkeeper | 0.911 | 0.901 | 0.906 | 0.904 | 0.495 |
+| referee | 0.849 | 0.911 | 0.879 | 0.907 | 0.536 |
+| ball | 0.643 | 0.501 | 0.563 | 0.443 | 0.173 |
+
+### Kết quả trên `dataset.zip` (Roboflow)
+
+`yolo26s + new dataset` — **đang dùng (`yolo26s-soccer.pt`)**:
+
+| Class | Precision | Recall | F1 | mAP50 | mAP50:95 |
+|---|---|---|---|---|---|
+| all | 0.846 | 0.824 | 0.835 | 0.830 | 0.514 |
+| player | 0.935 | 0.938 | 0.936 | 0.961 | 0.673 |
+| goalkeeper | 0.830 | 0.839 | 0.834 | 0.849 | 0.553 |
+| referee | 0.862 | 0.841 | 0.851 | 0.870 | 0.569 |
+| ball | 0.757 | 0.677 | 0.715 | 0.638 | 0.261 |
+
+`yolo26l (ball) ⇒ yolo26s + new dataset`:
+
+| Class | Precision | Recall | F1 | mAP50 | mAP50:95 |
+|---|---|---|---|---|---|
+| all | 0.853 | 0.802 | 0.827 | 0.828 | 0.507 |
+| player | 0.942 | 0.931 | 0.936 | 0.958 | 0.660 |
+| goalkeeper | 0.858 | 0.804 | 0.830 | 0.860 | 0.550 |
+| referee | 0.849 | 0.828 | 0.838 | 0.849 | 0.554 |
+| ball | 0.762 | 0.647 | 0.700 | 0.645 | 0.262 |
+
+Nhận xét:
+- Đổi dữ liệu train từ `dataset_cu` sang `dataset.zip` (cùng `yolo26s`, không distill) giúp nhiều nhất:
+  mAP50:95 (`all`) 0.465 → 0.514, `ball` tăng mạnh (mAP50 0.407 → 0.638, recall 0.443 → 0.677), `player`
+  0.630 → 0.673. Đổi lại, recall của `referee` giảm 0.956 → 0.841 và mAP50 của `goalkeeper` giảm 0.871 → 0.849.
+- `ball` là class khó nhất ở cả hai bộ: mAP50:95 chỉ 0.145–0.262, trong khi `player` đạt 0.58–0.67.
+- Trên `dataset_cu`, distill từ teacher `yolo26l (gk + ball)` tăng mAP50 của `goalkeeper` (0.871 → 0.904) và `ball` (0.407 → 0.443).
+  Đổi lại, mAP50:95 giảm ở `player` (0.630 → 0.579) và ở `all` (0.465 → 0.446): box kém khít hơn.
+- Trên `dataset.zip`, distill từ teacher `yolo26l (ball)` gần như không đổi gì: mAP50 của `ball` 0.638 → 0.645,
+  mAP50:95 của `all` 0.514 → 0.507, recall của `all` giảm 0.824 → 0.802. Vì vậy bản đang dùng không distill.
 
 ## Tham số hay dùng
 
@@ -158,15 +239,16 @@ bash scripts/run_minimap.sh match.mp4 outputs/minimap --minimap-video
 | `--minimap-video` | off | xuất thêm `<tên>_minimap.mp4` chỉ có minimap |
 | `--minimap-pos` | `bottom-right` | vị trí minimap: `bottom-left/center/right`, `top-left/center/right` |
 
-Trên minimap: chấm trắng có số = cầu thủ đã nhận ra số áo, xám = chưa, vàng = thủ môn, đen = trọng tài; vùng xanh nhạt
-= phần sân camera đang nhìn thấy. Frame không phải cảnh sân (close-up, khán đài, replay logo) -> minimap mờ đi, giữ vị
+Trên minimap: chấm tô màu áo của đội (xem [Chia đội](#chia-đội)), có số nếu đã nhận ra số áo. Cầu thủ chưa rõ đội:
+trắng nếu có số, xám nếu chưa. Thủ môn màu vàng, trọng tài màu đen.
+Vùng xanh nhạt là phần sân camera đang nhìn thấy. Frame không phải cảnh sân (close-up, khán đài, replay logo) -> minimap mờ đi, giữ vị
 trí cuối tối đa 3 s, ghi "no pitch view". Một cầu thủ ra khỏi khung hình thì biến khỏi minimap (chỉ vẽ ai đang thấy).
 
 Hệ toạ độ: (0, 0) = góc sân trên-trái của minimap, x theo chiều dài (0..L), y theo chiều rộng (0..W); cạnh dưới
 minimap là đường biên phía camera chính (cả 2 backend cùng quy ước).
 
 Giới hạn:
-- Chưa chia đội (chấm cùng màu cho cả 2 đội) và chưa có bóng.
+- Chưa vẽ bóng lên minimap (detector có class `ball` nhưng pipeline chưa dùng).
 - Cảnh chỉ thấy vạch biên + cỏ (giữa sân, camera zoom) có ít điểm mốc -> sau ~2 s optical flow thì mất phép chiếu.
 - Homography coi sân là mặt phẳng và bỏ qua méo ống kính: ở mép khung hình góc rộng có thể lệch 1–2 m.
 - Trong 1 shot, H mới lệch > 5 m so với dự đoán (thường do model nhầm khung thành trái/phải) bị loại và optical flow
@@ -190,7 +272,7 @@ Giới hạn:
 run.py                  # entry point: analyse (pass 1) + render (pass 2)
 scripts/                # setup.sh, run_*.sh cho từng luồng, compare.sh, diagnose.sh
 tools/diagnose.py       # chẩn đoán từng bước trên mọi cầu thủ
-yolo26s-soccer.pt       # detector bóng đá (0 ball, 1 goalkeeper, 2 player, 3 referee)
+yolo26s-soccer.pt       # detector bóng đá (0 ball, 1 goalkeeper, 2 player, 3 referee), xem "Detector & dataset"
 config.py               # đường dẫn weights, ngưỡng mặc định
 download_models.py      # tải weights legibility + PARSeq từ Google Drive
 kaggle_notebook.ipynb
