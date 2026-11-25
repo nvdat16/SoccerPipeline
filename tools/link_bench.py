@@ -76,15 +76,18 @@ def make_breaks(d, seed=0, every=50, gaps=(8, 15, 25, 40), crowd_r=3.0):
     for (f, t), v in newid.items():
         roles.setdefault(v, d["roles"].get(t, "player"))
     dd["roles"] = roles
+    if d.get("emb"):
+        dd["emb"] = {m(k): v for k, v in d["emb"].items() if k not in drop}
     return dd, truth
 
 
 def score(dd, truth, cfg, voter_kw, fps):
     L = IdentityLinker(fps, cfg, voter_kw)
-    L.run(dd["dets"], dd["positions"], dd["team_of"], dd["roles"], [])        # ẩn số áo
+    L.run(dd["dets"], dd["positions"], dd["team_of"], dd["roles"], [], emb=dd.get("emb"))   # ẩn số áo
     out = {(l["from_track"], l["from_frame"]): (l["to_track"], l["to_frame"]) for l in L.links}
     into = {v: k for k, v in out.items()}
     r = defaultdict(int)
+    r["reid", "resolved"] = L.n_reid
     for ta, fa, tb, fb, crowded in truth:
         g = "đông" if crowded else "thoáng"
         r[g, "n"] += 1
@@ -104,9 +107,13 @@ def main():
     ap.add_argument("--seeds", type=int, default=5)
     ap.add_argument("--every", type=int, default=50, help="cắt mỗi N frame của track")
     ap.add_argument("--set", nargs="*", default=[], metavar="KEY=VALUE", help="override hằng số trong config.py")
+    ap.add_argument("--emb", default=None, help="file .npz embedding re-ID (tools/reid_bench.py embed) -> linker dùng re-ID")
     a = ap.parse_args()
 
     d, fps = load_run(Path(a.run_dir))
+    if a.emb:
+        z = np.load(a.emb)
+        d["emb"] = {(int(f), int(t)): e for f, t, e in zip(z["frame"], z["track"], z["emb"])}
     cfg, voter_kw = make_cfg(a.set)
     tot = defaultdict(int)
     for seed in range(a.seeds):
@@ -122,6 +129,8 @@ def main():
         print(f"  {g:7s}: {n_:4d} chỗ đứt, nối lại đúng {ok_:4d} ({100 * ok_ / max(n_, 1):4.1f}%), nối sai {bad_}")
     print(f"  tổng   : {n:4d} chỗ đứt, nối lại đúng {ok:4d} ({100 * ok / max(n, 1):4.1f}%), nối sai {bad}, "
           f"độ chính xác {100 * ok / max(ok + bad, 1):.1f}%")
+    if a.emb:
+        print(f"  re-ID  : {tot['reid', 'resolved']} cặp đám đông được ngoại hình cho qua ({Path(a.emb).name})")
 
 
 if __name__ == "__main__":

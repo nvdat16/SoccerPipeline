@@ -196,7 +196,7 @@ class PlayerJerseyPipeline:
             if not rw.exists():
                 raise SystemExit(f"Không có weights re-ID {rw}. Chạy `python download_models.py`.")
             self.reid = OSNetEmbedder(rw, self.device)
-            print(f"[init] re-ID: OSNet-AIN ({rw.name}), box >= {config.REID_MIN_BOX_HEIGHT}px, mỗi {args.stride} frame")
+            print(f"[init] re-ID: {self.reid.arch} ({rw.name}), box >= {config.REID_MIN_BOX_HEIGHT}px, mỗi {args.stride} frame")
         if args.tile and self.det_is_pose and args.torso_mode == "pose":
             raise SystemExit("--tile chưa hỗ trợ lấy keypoint từ detector pose: dùng --torso-mode bbox")
         if args.tile:

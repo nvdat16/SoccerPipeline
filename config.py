@@ -46,6 +46,9 @@ MODEL_URLS = {
     PNL_LINE_FILE: "https://github.com/mguti97/PnLCalib/releases/download/v1.0.0/SV_lines",
     # OSNet-AIN x1.0 train MSMT17 (model zoo của deep-person-reid / torchreid, MIT) — chỉ cần với --reid
     "osnet_ain_x1_0_msmt17.pt": "https://drive.google.com/uc?id=1SigwBE6mPdqiJMqhuIY4aqC7--5CsMal",
+    # OSNet x1.0 của Deep-EIoU (Huang et al., WACVW 2024), fine-tune trên crop cầu thủ SportsMOT (sports_model.pth.tar-60;
+    # repo không ghi license, SportsMOT chỉ cho nghiên cứu) — REID_FILE mặc định của --reid
+    "osnet_x1_0_sportsmot_deepeiou.pt": "https://drive.google.com/uc?id=14zzlm1nI9Ws_Il9RYNChwPC7Fsul7xwl",
 }
 
 # ---------------------------------------------------------------- detection
@@ -144,8 +147,14 @@ LINK_CROWD_MARGIN = 0.5                 # cầu thủ cùng đội khác cách v
 # đứng gần > REID_MARGIN (khoảng cách cosine) -> cho nối, số áo truyền qua đó là 'uncertain'.
 # Đo trên clip_3400: trong đám đông ngoại hình chỉ chọn đúng ~62% (đồng đội mặc áo giống hệt; LDA theo video không
 # giúp), benchmark cắt track: +5 nối đúng / +3 nối sai -> mặc định tắt. Giữ lại để thay model re-ID riêng cho bóng đá.
+# 2026-11-25, Deep-EIoU OSNet (SportsMOT) trên clip_3400 (tools/reid_bench.py + link_bench --emb):
+#   phân biệt đồng đội < 3 m: rank-1 67.9% (MSMT17) -> 89.3%; link_bench tổng 387 đúng/33 sai (không re-ID)
+#   -> 392/22 (MSMT17: 380/32). Nhưng chỗ đứt THẬT: chỉ 5/96 cặp đám đông được phân định (45 cặp B quá ngắn, thiếu emb)
+#   -> vẫn tắt mặc định cho tới khi kiểm tra bằng mắt.
+#   SoccerNet-ReID OSNet (models/osnet_x1_0_soccernet_reid.pt, sn-reid baseline): rank-1 80.4%, link_bench 390/26;
+#   ở margin >= 0.1 không cho qua cặp sai nào. Chi tiết: experiments/reid_2026-11-25/RESULTS.md
 REID = False
-REID_FILE = "osnet_ain_x1_0_msmt17.pt"
+REID_FILE = "osnet_x1_0_sportsmot_deepeiou.pt"
 REID_MARGIN = 0.06
 REID_FRAMES = 10                        # trung bình embedding N frame cuối A / đầu B
 REID_MIN_BOX_HEIGHT = 40                # px

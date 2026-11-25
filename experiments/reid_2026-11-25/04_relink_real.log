@@ -1,0 +1,23 @@
+[outputs/minimap_v2/clip_3400] enc_split=False 
+  246 đoạn -> nối 47 (global; qua lần gặp 0), bỏ mập mờ 9, bỏ đông người 96, khác số 0
+  gặp đồng đội 0 lần, đoạn E gắn lại 0/0
+  detection có số: tự đọc 40.6% + nhờ nối 5.2% + không chắc 0.0% | 19 cầu thủ có số | trùng ID trong 1 frame: 0 | hạ số (chồng thời gian): 5
+  -> outputs/minimap_v2/clip_3400/relink_noreid
+[outputs/minimap_v2/clip_3400] enc_split=False  emb=emb_osnet_ain_x1_0_msmt17.npz
+  re-ID: 4 cặp đám đông được ngoại hình phân định -> nối 2
+  246 đoạn -> nối 50 (global; qua lần gặp 0), bỏ mập mờ 8, bỏ đông người 92, khác số 0
+  gặp đồng đội 0 lần, đoạn E gắn lại 0/0
+  detection có số: tự đọc 40.6% + nhờ nối 5.3% + không chắc 0.2% | 19 cầu thủ có số | trùng ID trong 1 frame: 0 | hạ số (chồng thời gian): 5
+  -> outputs/minimap_v2/clip_3400/relink_osnet_ain_x1_0_msmt17
+[outputs/minimap_v2/clip_3400] enc_split=False  emb=emb_osnet_x1_0_sportsmot_deepeiou.npz
+  re-ID: 5 cặp đám đông được ngoại hình phân định -> nối 2
+  246 đoạn -> nối 49 (global; qua lần gặp 0), bỏ mập mờ 9, bỏ đông người 91, khác số 0
+  gặp đồng đội 0 lần, đoạn E gắn lại 0/0
+  detection có số: tự đọc 40.6% + nhờ nối 5.2% + không chắc 0.2% | 19 cầu thủ có số | trùng ID trong 1 frame: 0 | hạ số (chồng thời gian): 5
+  -> outputs/minimap_v2/clip_3400/relink_osnet_x1_0_sportsmot_deepeiou
+[outputs/minimap_v2/clip_3400] enc_split=False  emb=emb_osnet_x1_0_soccernet_reid.npz
+  re-ID: 8 cặp đám đông được ngoại hình phân định -> nối 2
+  246 đoạn -> nối 48 (global; qua lần gặp 0), bỏ mập mờ 10, bỏ đông người 88, khác số 0
+  gặp đồng đội 0 lần, đoạn E gắn lại 0/0
+  detection có số: tự đọc 40.6% + nhờ nối 5.0% + không chắc 0.2% | 19 cầu thủ có số | trùng ID trong 1 frame: 0 | hạ số (chồng thời gian): 5
+  -> outputs/minimap_v2/clip_3400/relink_osnet_x1_0_soccernet_reid

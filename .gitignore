@@ -16,3 +16,7 @@ yolo11*.pt
 yolo26n*.pt
 yolo26s.pt
 yolo26s-pose.pt
+
+# video input (nặng, không commit)
+/*.mp4
+/*.mkv

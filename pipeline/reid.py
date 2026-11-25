@@ -139,6 +139,51 @@ class OSNetAIN(nn.Module):
         return self.fc(self.global_avgpool(x).flatten(1))
 
 
+# ---------------------------------------------------------------------------- OSNet x1.0 thường (osnet.py của torchreid)
+class OSBlockV1(nn.Module):
+    """OSBlock của osnet.py: 4 nhánh tên conv2a..conv2d (khác ModuleList conv2 của bản AIN), không IN."""
+
+    def __init__(self, cin, cout, reduction=4):
+        super().__init__()
+        mid = cout // reduction
+        self.conv1 = Conv1x1(cin, mid)
+        self.conv2a = LightConv3x3(mid, mid)
+        self.conv2b = nn.Sequential(*[LightConv3x3(mid, mid) for _ in range(2)])
+        self.conv2c = nn.Sequential(*[LightConv3x3(mid, mid) for _ in range(3)])
+        self.conv2d = nn.Sequential(*[LightConv3x3(mid, mid) for _ in range(4)])
+        self.gate = ChannelGate(mid)
+        self.conv3 = Conv1x1Linear(mid, cout)
+        self.downsample = Conv1x1Linear(cin, cout) if cin != cout else None
+
+    def forward(self, x):
+        x1 = self.conv1(x)
+        x2 = sum(self.gate(s(x1)) for s in (self.conv2a, self.conv2b, self.conv2c, self.conv2d))
+        identity = self.downsample(x) if self.downsample is not None else x
+        return F.relu(self.conv3(x2) + identity)
+
+
+class OSNetX1(nn.Module):
+    """osnet_x1_0: channels 64-256-384-512, feature 512. Pool nằm TRONG conv2/conv3 (index 2) như torchreid."""
+
+    def __init__(self, channels=(64, 256, 384, 512), feature_dim=512):
+        super().__init__()
+        c = channels
+        self.conv1 = ConvLayer(3, c[0], 7, stride=2, padding=3)
+        self.maxpool = nn.MaxPool2d(3, stride=2, padding=1)
+        self.conv2 = nn.Sequential(OSBlockV1(c[0], c[1]), OSBlockV1(c[1], c[1]),
+                                   nn.Sequential(Conv1x1(c[1], c[1]), nn.AvgPool2d(2, stride=2)))
+        self.conv3 = nn.Sequential(OSBlockV1(c[1], c[2]), OSBlockV1(c[2], c[2]),
+                                   nn.Sequential(Conv1x1(c[2], c[2]), nn.AvgPool2d(2, stride=2)))
+        self.conv4 = nn.Sequential(OSBlockV1(c[2], c[3]), OSBlockV1(c[3], c[3]))
+        self.conv5 = Conv1x1(c[3], c[3])
+        self.global_avgpool = nn.AdaptiveAvgPool2d(1)
+        self.fc = nn.Sequential(nn.Linear(c[3], feature_dim), nn.BatchNorm1d(feature_dim), nn.ReLU())
+
+    def forward(self, x):
+        x = self.conv5(self.conv4(self.conv3(self.conv2(self.maxpool(self.conv1(x))))))
+        return self.fc(self.global_avgpool(x).flatten(1))
+
+
 # ---------------------------------------------------------------------------- wrapper
 class OSNetEmbedder:
     SIZE = (128, 256)                                     # (w, h) như lúc train
@@ -146,10 +191,20 @@ class OSNetEmbedder:
     STD = np.array([0.229, 0.224, 0.225], np.float32) * 255
 
     def __init__(self, weights, device, batch=64):
-        self.model = OSNetAIN()
-        sd = torch.load(str(weights), map_location="cpu", weights_only=True)
+        # checkpoint torchreid gốc (vd Deep-EIoU sports_model.pth.tar-60) có numpy scalar (rank1) -> cho phép riêng
+        # mấy class numpy vô hại đó, vẫn weights_only=True (không chạy code tuỳ ý trong pickle)
+        try:
+            from numpy._core.multiarray import scalar                     # numpy >= 2
+        except ImportError:
+            from numpy.core.multiarray import scalar                      # numpy 1.x
+        safe = [(scalar, "numpy.core.multiarray.scalar"), np.dtype] + \
+               [type(np.dtype(t)) for t in ("float32", "float64", "int64")]
+        with torch.serialization.safe_globals(safe):
+            sd = torch.load(str(weights), map_location="cpu", weights_only=True)
         sd = sd.get("state_dict", sd)
         sd = {k.replace("module.", "", 1): v for k, v in sd.items() if "classifier" not in k}
+        self.arch = "osnet_x1_0" if any(".conv2a." in k for k in sd) else "osnet_ain_x1_0"   # tự nhận theo tên key
+        self.model = OSNetX1() if self.arch == "osnet_x1_0" else OSNetAIN()
         missing, unexpected = self.model.load_state_dict(sd, strict=False)
         if missing or unexpected:
             raise RuntimeError(f"OSNet weights không khớp: thiếu {missing[:5]}, thừa {unexpected[:5]}")

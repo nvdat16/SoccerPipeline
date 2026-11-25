@@ -75,6 +75,7 @@ def main():
     ap.add_argument("--enc-split", action=argparse.BooleanOptionalAction, default=config.ENC_SPLIT)
     ap.add_argument("--sum-th", type=float, default=config.SUM_THRESHOLD)
     ap.add_argument("--set", nargs="*", default=[], metavar="KEY=VALUE", help="override hằng số trong config.py")
+    ap.add_argument("--emb", default=None, help="file .npz embedding re-ID (tools/reid_bench.py embed) -> linker dùng re-ID")
     a = ap.parse_args()
 
     run = Path(a.run_dir)
@@ -87,7 +88,12 @@ def main():
     meta = d["meta"]
     cfg, voter_kw = make_cfg(a.set, enc_split=a.enc_split, sum_th=a.sum_th)
     linker = IdentityLinker(fps, cfg, voter_kw)
-    ident, players, stats = linker.run(d["dets"], d["positions"], d["team_of"], d["roles"], reads)
+    emb = None
+    if a.emb:
+        import numpy as np
+        z = np.load(a.emb)
+        emb = {(int(f), int(t)): e for f, t, e in zip(z["frame"], z["track"], z["emb"])}
+    ident, players, stats = linker.run(d["dets"], d["positions"], d["team_of"], d["roles"], reads, emb=emb)
 
     def patch(rows, header, path):
         with open(path, "w", newline="") as f:
@@ -106,12 +112,14 @@ def main():
         w = csv.writer(f)
         w.writerow(["frame", "track_id", "label", "prob"])
         w.writerows(reads)
-    meta = {**meta, "link": stats, "players": players, "relink": {"enc_split": a.enc_split, "set": a.set}}
+    meta = {**meta, "link": stats, "players": players, "relink": {"enc_split": a.enc_split, "set": a.set, "emb": a.emb}}
     (out / "tracks.json").write_text(json.dumps(meta, indent=2))
     (out / "links.json").write_text(json.dumps(linker.links, indent=1))
 
     n = max(stats["dets_total"], 1)
-    print(f"[{run}] enc_split={a.enc_split} {' '.join(a.set)}")
+    print(f"[{run}] enc_split={a.enc_split} {' '.join(a.set)}" + (f" emb={Path(a.emb).name}" if a.emb else ""))
+    if a.emb:
+        print(f"  re-ID: {stats['crowd_resolved_by_reid']} cặp đám đông được ngoại hình phân định -> nối {stats['links_reid']}")
     print(f"  {stats['segments']} đoạn -> nối {stats['links']} ({stats['solver']}; qua lần gặp {stats['encounter_links']}), bỏ mập mờ "
           f"{stats['skipped_ambiguous']}, bỏ đông người {stats['skipped_crowd']}, khác số {stats['skipped_number_conflict']}")
     print(f"  gặp đồng đội {stats['encounters']} lần, đoạn E gắn lại {stats['encounter_segments_attached']}/"

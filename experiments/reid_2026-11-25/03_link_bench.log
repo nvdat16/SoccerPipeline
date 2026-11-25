@@ -1,0 +1,23 @@
+=== không re-ID
+solver=global accept=1.2 ambiguity=0.3 crowd_margin=0.5 (5 seed)
+  thoáng :  439 chỗ đứt, nối lại đúng  329 (74.9%), nối sai 25
+  đông   :   79 chỗ đứt, nối lại đúng   58 (73.4%), nối sai 8
+  tổng   :  518 chỗ đứt, nối lại đúng  387 (74.7%), nối sai 33, độ chính xác 92.1%
+=== osnet_ain_x1_0_msmt17
+solver=global accept=1.2 ambiguity=0.3 crowd_margin=0.5 (5 seed)
+  thoáng :  439 chỗ đứt, nối lại đúng  322 (73.3%), nối sai 24
+  đông   :   79 chỗ đứt, nối lại đúng   58 (73.4%), nối sai 8
+  tổng   :  518 chỗ đứt, nối lại đúng  380 (73.4%), nối sai 32, độ chính xác 92.2%
+  re-ID  : 46 cặp đám đông được ngoại hình cho qua (emb_osnet_ain_x1_0_msmt17.npz)
+=== osnet_x1_0_sportsmot_deepeiou
+solver=global accept=1.2 ambiguity=0.3 crowd_margin=0.5 (5 seed)
+  thoáng :  439 chỗ đứt, nối lại đúng  331 (75.4%), nối sai 22
+  đông   :   79 chỗ đứt, nối lại đúng   61 (77.2%), nối sai 0
+  tổng   :  518 chỗ đứt, nối lại đúng  392 (75.7%), nối sai 22, độ chính xác 94.7%
+  re-ID  : 87 cặp đám đông được ngoại hình cho qua (emb_osnet_x1_0_sportsmot_deepeiou.npz)
+=== osnet_x1_0_soccernet_reid
+solver=global accept=1.2 ambiguity=0.3 crowd_margin=0.5 (5 seed)
+  thoáng :  439 chỗ đứt, nối lại đúng  333 (75.9%), nối sai 22
+  đông   :   79 chỗ đứt, nối lại đúng   57 (72.2%), nối sai 4
+  tổng   :  518 chỗ đứt, nối lại đúng  390 (75.3%), nối sai 26, độ chính xác 93.8%
+  re-ID  : 98 cặp đám đông được ngoại hình cho qua (emb_osnet_x1_0_soccernet_reid.npz)

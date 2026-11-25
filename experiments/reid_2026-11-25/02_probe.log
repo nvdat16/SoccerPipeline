@@ -1,0 +1,4 @@
+chỗ đứt 'đông' (đồng đội < 3.0 m), 5 seed, trung bình 10 frame, margin 0.06
+  emb_osnet_ain_x1_0_msmt17                  n=  56  rank-1  67.9%  cho qua đúng  19.6%  sai 10.7%  | d(A,B) 0.103  d(A,đồng đội gần nhất) 0.130  (thiếu emb 23)
+  emb_osnet_x1_0_sportsmot_deepeiou          n=  56  rank-1  89.3%  cho qua đúng  71.4%  sai 10.7%  | d(A,B) 0.118  d(A,đồng đội gần nhất) 0.219  (thiếu emb 23)
+  emb_osnet_x1_0_soccernet_reid              n=  56  rank-1  80.4%  cho qua đúng  55.4%  sai  5.4%  | d(A,B) 0.162  d(A,đồng đội gần nhất) 0.235  (thiếu emb 23)
